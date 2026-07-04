@@ -132,6 +132,85 @@ fn sanitize(s: &str) -> String {
 }
 
 // ---- macOS: AppKit print-to-PDF (US Letter, margins, paginated) -----------
+//
+// Two hard-won correctness rules encoded here:
+//
+// 1. WKWebView paginates print content in a SEPARATE process, serviced by the
+//    main runloop. The synchronous `runOperation` blocks that runloop, so
+//    pagination never converges and the spool file grows without bound
+//    (observed: a 550 MB unopenable PDF and a crash). The operation MUST be
+//    run asynchronously via runOperationModalForWindow:…didRunSelector:, with
+//    completion delivered to a delegate.
+//
+// 2. AppKit string constants are NOT their symbol names at runtime (e.g.
+//    NSPrintJobSavingURL is "NSJobSavingURL"). Hand-writing the literals
+//    silently misses, and AppKit throws up a save dialog because the save job
+//    has no destination. We link the real symbols so the linker guarantees
+//    the values.
+
+#[cfg(target_os = "macos")]
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {
+    // NSString* constants (the symbol is a global holding the object pointer).
+    static NSPrintSaveJob: *mut objc2::runtime::AnyObject;
+    static NSPrintJobSavingURL: *mut objc2::runtime::AnyObject;
+}
+
+/// Completion callback for NSPrintOperation's async run. `contextInfo` carries
+/// a boxed oneshot sender for the result.
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn print_did_run(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _op: *mut objc2::runtime::AnyObject,
+    success: objc2::runtime::Bool,
+    context: *mut std::ffi::c_void,
+) {
+    if context.is_null() {
+        return;
+    }
+    let tx = Box::from_raw(
+        context as *mut tokio::sync::oneshot::Sender<Result<(), String>>,
+    );
+    let _ = tx.send(if success.as_bool() {
+        Ok(())
+    } else {
+        Err("print operation failed or was cancelled".into())
+    });
+}
+
+/// Lazily register a one-off Objective-C delegate class + shared instance for
+/// print completions. The instance is stateless (context carries the payload),
+/// so a single leaked object serves every export.
+#[cfg(target_os = "macos")]
+fn print_delegate() -> *mut objc2::runtime::AnyObject {
+    use objc2::runtime::{AnyObject, Bool, ClassBuilder, Sel};
+    use objc2::{class, msg_send, sel};
+    use std::sync::OnceLock;
+
+    static INSTANCE: OnceLock<usize> = OnceLock::new();
+    *INSTANCE.get_or_init(|| {
+        let mut builder = ClassBuilder::new(c"WwwToPdfPrintDelegate", class!(NSObject))
+            .expect("delegate class name already taken");
+        unsafe {
+            builder.add_method(
+                sel!(printOperationDidRun:success:contextInfo:),
+                print_did_run
+                    as unsafe extern "C" fn(
+                        *mut AnyObject,
+                        Sel,
+                        *mut AnyObject,
+                        Bool,
+                        *mut std::ffi::c_void,
+                    ),
+            );
+        }
+        let cls = builder.register();
+        let obj: *mut AnyObject = unsafe { msg_send![cls, new] };
+        obj as usize
+    }) as *mut objc2::runtime::AnyObject
+}
+
 #[cfg(target_os = "macos")]
 async fn render_pdf(
     webview: &tauri::WebviewWindow,
@@ -140,7 +219,7 @@ async fn render_pdf(
 ) -> Result<(), String> {
     use objc2::encode::{Encode, Encoding};
     use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
+    use objc2::{class, msg_send, sel};
 
     // Minimal CGSize so we can pass NSPrintInfo.paperSize by value without the
     // objc2-foundation feature-flag chain.
@@ -164,24 +243,24 @@ async fn render_pdf(
         p.bottom * PT_PER_IN,
         p.left * PT_PER_IN,
     );
-    let out_path = out_path.to_string();
+    let out_path_owned = out_path.to_string();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     let tx = std::sync::Mutex::new(Some(tx));
 
     webview
         .with_webview(move |platform| {
-            // SAFETY: `inner()` is this webview's live WKWebView; we build a save
-            // print operation and run it on the main thread.
+            // Runs on the main thread. SAFETY: `inner()`/`ns_window()` are this
+            // webview's live WKWebView/NSWindow; the print operation retains
+            // what it needs, and completion arrives via the delegate above.
             unsafe {
+                let tx = tx.lock().unwrap().take();
+                let Some(tx) = tx else { return };
                 let wk = platform.inner() as *mut AnyObject;
-                let send = |r: Result<(), String>| {
-                    if let Some(t) = tx.lock().unwrap().take() {
-                        let _ = t.send(r);
-                    }
-                };
-                if wk.is_null() {
-                    return send(Err("webview handle was null".into()));
+                let win = platform.ns_window() as *mut AnyObject;
+                if wk.is_null() || win.is_null() {
+                    let _ = tx.send(Err("webview/window handle was null".into()));
+                    return;
                 }
 
                 let nsstring = |s: &str| -> *mut AnyObject {
@@ -203,32 +282,49 @@ async fn render_pdf(
                 let _: () = msg_send![info, setHorizontalPagination: 1usize];
                 let _: () = msg_send![info, setVerticalPagination: 0usize];
 
-                // Job disposition -> save; destination URL in the info dictionary.
-                let _: () = msg_send![info, setJobDisposition: nsstring("NSPrintSaveJob")];
+                // Save-to-file disposition + destination, via the REAL AppKit
+                // symbols (see note above about literal values).
+                let _: () = msg_send![info, setJobDisposition: NSPrintSaveJob];
                 let dict: *mut AnyObject = msg_send![info, dictionary];
                 let file_url: *mut AnyObject =
-                    msg_send![class!(NSURL), fileURLWithPath: nsstring(&out_path)];
-                let key = nsstring("NSPrintJobSavingURL");
-                let _: () = msg_send![dict, setObject: file_url, forKey: key];
+                    msg_send![class!(NSURL), fileURLWithPath: nsstring(&out_path_owned)];
+                let _: () = msg_send![dict, setObject: file_url, forKey: NSPrintJobSavingURL];
 
                 let op: *mut AnyObject = msg_send![wk, printOperationWithPrintInfo: info];
                 if op.is_null() {
-                    return send(Err("could not create print operation".into()));
+                    let _ = tx.send(Err("could not create print operation".into()));
+                    return;
                 }
                 let _: () = msg_send![op, setShowsPrintPanel: false];
                 let _: () = msg_send![op, setShowsProgressPanel: false];
-                let ok: bool = msg_send![op, runOperation];
-                send(if ok {
-                    Ok(())
-                } else {
-                    Err("print operation failed".into())
-                });
+
+                // Async run; the delegate's callback fires when WebKit has
+                // finished paginating and the file is written.
+                let context = Box::into_raw(Box::new(tx)) as *mut std::ffi::c_void;
+                let _: () = msg_send![
+                    op,
+                    runOperationModalForWindow: win,
+                    delegate: print_delegate(),
+                    didRunSelector: sel!(printOperationDidRun:success:contextInfo:),
+                    contextInfo: context
+                ];
             }
         })
         .map_err(|e| e.to_string())?;
 
-    rx.await
-        .map_err(|_| "print completion was dropped".to_string())?
+    // Guard against a completion that never arrives (e.g. WebKit wedges).
+    let result = tokio::time::timeout(std::time::Duration::from_secs(180), rx)
+        .await
+        .map_err(|_| "PDF render timed out after 180s".to_string())?
+        .map_err(|_| "print completion was dropped".to_string())?;
+    result?;
+
+    // The delegate reported success — sanity-check the artifact.
+    match std::fs::metadata(out_path) {
+        Ok(m) if m.len() > 0 => Ok(()),
+        Ok(_) => Err("print finished but the PDF is empty".into()),
+        Err(_) => Err("print finished but no file was written".into()),
+    }
 }
 
 // iOS export (UIPrintPageRenderer -> PDF) is not implemented yet; the app runs,

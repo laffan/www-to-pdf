@@ -27,12 +27,6 @@ async function tauriInvoke(cmd, args) {
   return invoke(cmd, args);
 }
 
-// Show the "use the app" hint only in the browser build (never in the app).
-if (!isTauri) {
-  const note = $("app-note");
-  if (note) note.hidden = false;
-}
-
 // ---- URL entry ------------------------------------------------------------
 $("url-form").addEventListener("submit", (e) => {
   e.preventDefault();

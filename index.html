@@ -14,32 +14,17 @@
   <body>
     <!-- ============ SCREEN 1: URL ENTRY ============ -->
     <main id="entry" class="entry">
-      <div class="entry-card">
-        <div class="brand"><span class="brand-mark">📄</span> www&nbsp;→&nbsp;pdf</div>
-        <p class="tagline">
-          Load a page, remove the clutter, tune the type, and save a clean PDF.
-        </p>
-        <form id="url-form" class="url-form" autocomplete="off">
-          <input
-            id="url-input"
-            type="url"
-            inputmode="url"
-            placeholder="https://example.com/article"
-            required
-          />
-          <button type="submit">Load</button>
-        </form>
-        <p class="entry-note" id="entry-error" hidden></p>
-        <p class="entry-help" id="app-note" hidden>
-          Sites that require a login or block embedding can only be edited in
-          the <strong>desktop / iOS app</strong> — the browser can't edit a
-          page from another origin.
-        </p>
-      </div>
-      <footer class="entry-foot">
-        Runs entirely in your browser. Nothing is uploaded.
-        <a href="https://github.com/laffan/www-to-pdf" target="_blank" rel="noopener">Source</a>
-      </footer>
+      <form id="url-form" class="url-form" autocomplete="off">
+        <input
+          id="url-input"
+          type="url"
+          inputmode="url"
+          placeholder="https://example.com/article"
+          required
+        />
+        <button type="submit">Load</button>
+      </form>
+      <p class="entry-note" id="entry-error" hidden></p>
     </main>
 
     <!-- ============ SCREEN 2: VIEWER ============ -->

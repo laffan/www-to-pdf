@@ -38,28 +38,14 @@ body {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  gap: 24px;
+  gap: 12px;
 }
-.entry-card {
+.url-form {
+  display: flex;
+  gap: 8px;
   width: 100%;
   max-width: 540px;
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: 20px;
-  padding: 32px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.08);
 }
-.brand {
-  font-size: 26px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.brand-mark { font-size: 30px; }
-.tagline { color: var(--muted); margin: 8px 0 22px; }
-.url-form { display: flex; gap: 8px; }
 .url-form input {
   flex: 1;
   min-width: 0;
@@ -81,11 +67,7 @@ body {
   border-radius: 11px;
   cursor: pointer;
 }
-.entry-note { color: #dc2626; font-size: 13px; margin: 10px 2px 0; }
-.entry-help { margin-top: 20px; font-size: 14px; }
-.entry-help { color: var(--muted); font-size: 13px; margin-top: 18px; }
-.entry-foot { color: var(--muted); font-size: 13px; }
-.entry-foot a { color: inherit; }
+.entry-note { color: #dc2626; font-size: 13px; margin: 0; }
 
 /* ---------- viewer screen ---------- */
 .viewer { position: fixed; inset: 0; display: flex; flex-direction: column; }
