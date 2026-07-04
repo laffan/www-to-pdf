@@ -1,0 +1,12 @@
+import { chromium } from "playwright";
+const b = await chromium.launch({ executablePath: process.env.PW_CHROME, args:["--no-sandbox"] });
+const p = await b.newPage({ viewport: { width: 1150, height: 780 } });
+p.on("pageerror", e => console.log("[pageerror]", e.message));
+await p.goto("http://localhost:4173/");
+await p.evaluate(() => localStorage.setItem("wwwpdf:history", JSON.stringify(["https://example.substack.com/p/some-article","https://en.wikipedia.org/wiki/Portable_Document_Format"])));
+await p.reload();
+await p.waitForTimeout(300);
+const r = await p.evaluate(() => document.querySelectorAll("#history li").length);
+console.log("history items:", r);
+await p.screenshot({ path: process.env.DIR + "/stage1.png" });
+await b.close();

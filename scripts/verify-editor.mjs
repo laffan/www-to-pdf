@@ -86,9 +86,62 @@ check("margin edit updates @page", await page.evaluate(() =>
   document.getElementById("wwwpdf-style").textContent.includes("margin:0.5in 1in 1in 1in;")
 ));
 
-// 6. unmount removes the panel
+// 6. metadata header: sans-serif, no horizontal padding, survives hostile CSS
+check("metadata is sans-serif", await page.evaluate(() => {
+  const m = document.getElementById("wwwpdf-meta");
+  return m && !/georgia|times/i.test(getComputedStyle(m).fontFamily);
+}));
+check("metadata has no horizontal padding", await page.evaluate(() => {
+  const cs = getComputedStyle(document.getElementById("wwwpdf-meta"));
+  return cs.paddingLeft === "0px" && cs.paddingRight === "0px";
+}));
+check("metadata survives hostile site CSS", await page.evaluate(() => {
+  const hostile = document.createElement("style");
+  hostile.textContent = "body > div { display:none; font-family: Georgia !important; }";
+  document.head.appendChild(hostile);
+  const cs = getComputedStyle(document.getElementById("wwwpdf-meta"));
+  return cs.display !== "none" && !/georgia/i.test(cs.fontFamily);
+}));
+
+// 7. applySettings drives fonts + metadata (the stage-3 preview window path)
+await page.evaluate(() =>
+  window.wwwToPdf.applySettings({
+    bodyPx: 18,
+    headingScale: 1.5,
+    margins: { top: 0.75 },
+    meta: { show: true, author: "Test Author" },
+  })
+);
+check("applySettings sets body font", await page.evaluate(() =>
+  Math.round(parseFloat(getComputedStyle(document.getElementById("para")).fontSize)) === 18
+));
+check("applySettings updates @page margins", await page.evaluate(() =>
+  document.getElementById("wwwpdf-style").textContent.includes("margin:0.75in")
+));
+check("applySettings updates metadata", await page.evaluate(() =>
+  document.getElementById("wwwpdf-meta").textContent.includes("Test Author")
+));
+
+// 8. unmount removes the panel
 await page.evaluate(() => window.wwwToPdf.unmount());
 check("unmount removes panel", await page.evaluate(() => !document.getElementById("wwwpdf-panel")));
+
+// 9. Tauri mode: stage-2 panel is remove-tools + Next only
+const page2 = await browser.newPage();
+await page2.setContent(SAMPLE, { waitUntil: "load" });
+await page2.evaluate(() => { window.__TAURI_INTERNALS__ = {}; });
+await page2.addScriptTag({ content: EDITOR });
+check("tauri panel has Next button", await page2.evaluate(() =>
+  [...document.querySelectorAll("#wwwpdf-panel button")].some((b) =>
+    b.textContent.includes("PDF settings")
+  )
+));
+check("tauri panel has no sliders/save", await page2.evaluate(() =>
+  document.querySelectorAll("#wwwpdf-panel input[type=range]").length === 0 &&
+  ![...document.querySelectorAll("#wwwpdf-panel button")].some((b) =>
+    b.textContent.includes("Save as PDF")
+  )
+));
 
 await browser.close();
 

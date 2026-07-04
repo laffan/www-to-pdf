@@ -117,14 +117,23 @@
       "  html::after{display:none!important}",
       "  #" + NS + "-meta{display:" + (state.meta.show ? "block" : "none") + "!important}",
       "}",
-      // On-screen metadata header preview.
-      "#" + NS + "-meta{display:" + (state.meta.show ? "block" : "none") + ";" +
-        "font-family:Georgia,'Times New Roman',serif;border-bottom:2px solid #111;" +
-        "padding:14px 18px;margin:0 0 18px;background:#fff;color:#111}",
-      "#" + NS + "-meta h1{font-size:20px!important;margin:0 0 6px}",
-      "#" + NS + "-meta dl{display:grid;grid-template-columns:auto 1fr;gap:2px 14px;margin:0;font-size:12px}",
-      "#" + NS + "-meta dt{font-weight:700;color:#555}",
-      "#" + NS + "-meta dd{margin:0}",
+      // Metadata header. Everything is !important so host-site CSS (resets,
+      // `body > div` rules, etc.) can't hide or restyle it — the cause of the
+      // "shows in export but not on screen" bug. No horizontal padding: the
+      // block must sit flush inside the page margins like the rest of the
+      // content. Sans-serif by design.
+      "#" + NS + "-meta{display:" + (state.meta.show ? "block" : "none") + "!important;" +
+        "position:relative!important;z-index:2147483645!important;" +
+        "font-family:system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif!important;" +
+        "border-bottom:1.5px solid #111!important;padding:0 0 12px!important;" +
+        "margin:0 0 20px!important;background:transparent!important;color:#111!important;" +
+        "max-width:none!important;width:auto!important;text-align:left!important}",
+      "#" + NS + "-meta h1{font-size:19px!important;line-height:1.3!important;margin:0 0 8px!important;" +
+        "font-family:inherit!important;color:inherit!important;font-weight:700!important}",
+      "#" + NS + "-meta dl{display:grid!important;grid-template-columns:auto 1fr;gap:2px 14px;" +
+        "margin:0!important;font-size:12px!important;font-family:inherit!important}",
+      "#" + NS + "-meta dt{font-weight:600!important;color:#555!important;margin:0!important}",
+      "#" + NS + "-meta dd{margin:0!important;color:inherit!important}",
     ].join("\n");
   }
 
@@ -326,6 +335,28 @@
     });
     count.textContent = "0 removed";
 
+    // Native app (stage 2): the page is for logging in and adding/removing
+    // material only. Fonts, metadata, and margins live in the PDF-settings
+    // window (stage 3), which previews the real generated PDF.
+    if (window.__TAURI_INTERNALS__) {
+      var nextBtn = el(
+        "button",
+        { style: STYLE_PRIMARY, onclick: gotoStage3 },
+        ["Next: PDF settings →"]
+      );
+      var divider = function () {
+        return el("div", { style: "height:1px;background:#ececf0;margin:10px 0" });
+      };
+      panel.appendChild(bar);
+      panel.appendChild(removeBtn);
+      panel.appendChild(el("div", { style: "height:6px" }));
+      panel.appendChild(removeRow);
+      panel.appendChild(count);
+      panel.appendChild(divider());
+      panel.appendChild(nextBtn);
+      return panel;
+    }
+
     // font controls
     function slider(label, min, max, val, step, oninput, valfmt) {
       var out = el("span", { style: "font-variant-numeric:tabular-nums;color:#111" }, [
@@ -451,11 +482,7 @@
     var hint = el(
       "div",
       { style: "font-size:11px;color:#a1a1aa;text-align:center;margin-top:6px" },
-      [
-        window.__TAURI_INTERNALS__
-          ? "Saves a US-Letter PDF to your Downloads"
-          : "Choose “Save as PDF” in the print dialog",
-      ]
+      ["Choose “Save as PDF” in the print dialog"]
     );
 
     function sep() {
@@ -509,12 +536,42 @@
     });
   }
 
-  // ---- export --------------------------------------------------------------
-  // Sentinel host used to signal the native app. The Rust `on_navigation`
-  // handler recognises it, cancels the navigation (the page is untouched), and
-  // renders this webview to a PDF. Avoids the Tauri IPC ACL entirely, which is
-  // unreliable for dynamically-created remote webviews.
-  var EXPORT_HOST = "wwwtopdf.export";
+  // ---- stage hand-off / export ---------------------------------------------
+  // Sentinel host used to signal the native app that stage 2 (DOM editing) is
+  // done. The Rust `on_navigation` handler recognises it, cancels the
+  // navigation (the page is untouched), and opens the PDF-settings window.
+  // Sentinel navigation avoids the Tauri IPC ACL entirely, which is unreliable
+  // for dynamically-created remote webviews.
+  var STAGE3_HOST = "wwwtopdf.stage3";
+
+  function gotoStage3() {
+    setRemoveMode(false);
+    var q =
+      "title=" + encodeURIComponent(document.title || "") +
+      "&url=" + encodeURIComponent(state.meta.url || location.href);
+    window.location.href = "https://" + STAGE3_HOST + "/?" + q;
+  }
+
+  // Applied by the PDF-settings window (via native eval) — fonts and metadata
+  // must live in the page's own DOM so they show up in the rendered PDF.
+  function applySettings(s) {
+    if (!s) return;
+    if (typeof s.bodyPx === "number") state.bodyPx = s.bodyPx;
+    else if (s.bodyPx === null) state.bodyPx = null;
+    if (typeof s.headingScale === "number") state.headingScale = s.headingScale;
+    if (s.margins) {
+      ["top", "right", "bottom", "left"].forEach(function (k) {
+        if (typeof s.margins[k] === "number") state.margins[k] = s.margins[k];
+      });
+    }
+    if (s.meta) {
+      Object.keys(s.meta).forEach(function (k) {
+        state.meta[k] = s.meta[k];
+      });
+    }
+    render_style();
+    renderMeta();
+  }
 
   function exportPdf() {
     // If a host wants to drive export itself, let it.
@@ -522,29 +579,9 @@
       var handled = window.wwwToPdf.onExport(collect());
       if (handled === true) return;
     }
-
-    // Native app path (Tauri webview): trigger via a sentinel navigation.
-    if (window.__TAURI_INTERNALS__) {
-      var m = state.margins;
-      var q =
-        "title=" + encodeURIComponent(state.meta.title || document.title || "") +
-        "&mt=" + m.top + "&mr=" + m.right + "&mb=" + m.bottom + "&ml=" + m.left;
-      toast("Rendering PDF…");
-      // Let the toast paint, then hand off to the native handler.
-      setTimeout(function () {
-        window.location.href = "https://" + EXPORT_HOST + "/?" + q;
-      }, 30);
-      return;
-    }
-
     // Web path: the browser's print dialog (choose "Save as PDF").
     window.focus();
     window.print();
-  }
-
-  // Called by the native side (via webview.eval) once a PDF has been written.
-  function afterExport(ok, message) {
-    toast((ok ? "Saved PDF → " : "PDF export failed: ") + message);
   }
 
   function toast(msg) {
@@ -612,7 +649,7 @@
   window.wwwToPdf.unmount = unmount;
   window.wwwToPdf.state = state;
   window.wwwToPdf.toast = toast; // native side calls this for progress/errors
-  window.wwwToPdf.afterExport = afterExport;
+  window.wwwToPdf.applySettings = applySettings;
 
   if (!window.__WWWTOPDF_NO_AUTOMOUNT) {
     if (document.readyState === "loading") {

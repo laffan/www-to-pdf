@@ -25,7 +25,55 @@
         <button type="submit">Load</button>
       </form>
       <p class="entry-note" id="entry-error" hidden></p>
+      <ul id="history" class="history"></ul>
     </main>
+
+    <!-- ============ SCREEN 3 (native): PDF SETTINGS + LIVE PREVIEW ============ -->
+    <div id="pdf-settings" class="pv" hidden>
+      <aside class="pv-side">
+        <label class="pv-check">
+          <input id="pv-meta-on" type="checkbox" />
+          <span>Include metadata header</span>
+        </label>
+        <div id="pv-meta-fields" class="pv-fields" hidden>
+          <label>Title <input id="pv-title" type="text" /></label>
+          <label>URL <input id="pv-url" type="text" /></label>
+          <label>Author <input id="pv-author" type="text" /></label>
+          <label>Access date <input id="pv-date" type="date" /></label>
+          <label>Notes <input id="pv-notes" type="text" /></label>
+        </div>
+
+        <div class="pv-sep"></div>
+
+        <div class="pv-slider">
+          <div class="pv-slider-head"><span>Body text</span><span id="pv-body-out">16px</span></div>
+          <input id="pv-body" type="range" min="12" max="28" step="1" value="16" />
+        </div>
+        <div class="pv-slider">
+          <div class="pv-slider-head"><span>Heading size</span><span id="pv-head-out">100%</span></div>
+          <input id="pv-head" type="range" min="0.6" max="2" step="0.05" value="1" />
+        </div>
+
+        <div class="pv-sep"></div>
+
+        <div class="pv-label">Page — US Letter (8.5 × 11 in) · margins</div>
+        <div class="pv-margins">
+          <label>Top (in) <input id="pv-mt" type="number" min="0" max="3" step="0.05" value="1" /></label>
+          <label>Right (in) <input id="pv-mr" type="number" min="0" max="3" step="0.05" value="1" /></label>
+          <label>Bottom (in) <input id="pv-mb" type="number" min="0" max="3" step="0.05" value="1" /></label>
+          <label>Left (in) <input id="pv-ml" type="number" min="0" max="3" step="0.05" value="1" /></label>
+        </div>
+
+        <div class="pv-sep"></div>
+
+        <button id="pv-save" class="primary">Save PDF…</button>
+        <p id="pv-status" class="pv-status"></p>
+      </aside>
+      <div class="pv-stage">
+        <iframe id="pv-frame" title="PDF preview"></iframe>
+        <div id="pv-loading" class="pv-loading" hidden>Rendering…</div>
+      </div>
+    </div>
 
     <!-- ============ SCREEN 2: VIEWER ============ -->
     <div id="viewer" class="viewer" hidden>

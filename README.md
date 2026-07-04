@@ -2,14 +2,16 @@
 
 Capture a website, tidy it up, and save it as a clean PDF.
 
-Load a page, then use an in-page toolbar to:
+The native app is a four-stage flow:
 
-- **Log in** if the site needs it
-- **Remove elements** (nav bars, cookie banners, ads, footers…) by clicking them
-- **Tune type** — body text size and heading scale
-- **Add a metadata header** (title, URL, author, access date, notes)
-- **Set page margins** — US Letter output with per-side margins
-- **Save as PDF**
+1. **URL entry** — type or pick from your recent links.
+2. **Page editing** — the site opens in a real webview: log in if needed, then
+   click elements to remove clutter (nav bars, cookie banners, ads…).
+3. **PDF settings** — a second window shows a live preview that is the *actual
+   generated PDF*, with controls for body/heading size, per-side margins
+   (US Letter output), and a sans-serif metadata header (title, URL, author,
+   access date, notes).
+4. **Save** — a native save dialog on desktop; the share sheet on iOS.
 
 It ships as a **web app** (GitHub Pages) and a **native app** (Tauri 2, desktop + iOS/Android).
 
@@ -43,30 +45,34 @@ The web (GitHub Pages) build works for same-origin and framable pages. Anything
 that blocks framing or needs a login can only be captured in the **native app**,
 whose webview has no cross-origin limit — that's the app's reason to exist.
 
-### Saving the PDF
+### How the native staged flow hangs together
 
-Output is **US Letter (8.5 × 11 in)** with adjustable margins (set per-side in
-the toolbar; toggle "Show margin guide" to preview the printable area).
+Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
 
-- **Web build:** `Save as PDF` calls `window.print()` with an injected
-  `@page { size: 8.5in 11in; margin: … }`, so the browser paginates to real
-  Letter sheets. You pick "Save as PDF" in the print dialog. Works in real
-  browsers, including iPad Safari.
-- **Native app:** `window.print()` is unreliable in WKWebView, and app-command
-  IPC from a dynamically-created *remote* webview is denied by Tauri's ACL
-  ([#10317](https://github.com/tauri-apps/tauri/issues/10317)). So the editor
-  signals the app by navigating to a sentinel URL
-  (`https://wwwtopdf.export/?…`); Rust's `on_navigation` hook cancels that
-  navigation (the edited page is untouched) and renders the webview through
-  **AppKit's print pipeline** (`printOperationWithPrintInfo:`, a silent
-  save-to-PDF job) with the chosen Letter paper size and margins. The saved
-  path is reported back into the toolbar's toast via script injection (which,
-  unlike IPC, works on any origin). Saved to Downloads.
+- **Stage 2 → 3 hand-off:** app-command IPC from a dynamically-created *remote*
+  webview is denied by Tauri's ACL
+  ([#10317](https://github.com/tauri-apps/tauri/issues/10317)), so the injected
+  toolbar's "Next" navigates to a sentinel URL (`https://wwwtopdf.stage3/?…`);
+  Rust's `on_navigation` hook cancels the navigation (the edited page is
+  untouched) and opens the PDF-settings window.
+- **Stage 3 preview:** the settings window is *local* UI, so it uses normal
+  IPC. Each change is `eval`'d into the target page (fonts/metadata must live
+  in the page DOM to print), then the page is rendered through **AppKit's
+  print pipeline** (`printOperationWithPrintInfo:`, silent save-to-PDF, run
+  asynchronously — the synchronous run deadlocks WKWebView) to a temp file
+  shown via the asset protocol. What you see is the real paginated PDF.
+- **Stage 4 save:** a native save dialog (`tauri-plugin-dialog`); the chosen
+  location receives a *copy of the previewed file*, so the saved PDF is
+  byte-identical to what was on screen. On iOS the same button hands the file
+  to the share sheet (`UIActivityViewController`).
+- **Web build:** no programmatic PDF generation exists in-browser, so the
+  in-page toolbar keeps all controls and `Save as PDF` calls `window.print()`
+  with an injected `@page { size: 8.5in 11in; margin: … }` — the print dialog
+  is the preview. Works in real browsers, including iPad Safari.
 
-> Because the trigger is a navigation (not an IPC command), no remote-IPC
-> capability is needed and loaded pages get no access to app commands.
-> **macOS only for now** — iOS export (via `UIPrintPageRenderer`) is a TODO;
-> the app otherwise runs on iOS.
+> **Rendering is macOS-only for now** — the iOS renderer (via
+> `UIPrintPageRenderer`) is a TODO; the share-sheet plumbing is already in
+> place. The app otherwise runs on iOS.
 
 ---
 
