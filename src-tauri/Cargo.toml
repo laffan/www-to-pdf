@@ -1,0 +1,23 @@
+[package]
+name = "www-to-pdf"
+version = "0.1.0"
+description = "Capture a website, clean it up, and save it as a PDF."
+authors = ["laffan"]
+edition = "2021"
+rust-version = "1.77"
+
+# The mobile targets (iOS/Android) build this crate as a library.
+[lib]
+name = "www_to_pdf_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
