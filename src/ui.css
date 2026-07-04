@@ -79,20 +79,7 @@ body {
 }
 .entry-note { color: #dc2626; font-size: 13px; margin: 10px 2px 0; }
 .entry-help { margin-top: 20px; font-size: 14px; }
-.entry-help summary { cursor: pointer; color: var(--muted); font-weight: 500; }
-.entry-help p { color: var(--muted); }
-.bookmarklet {
-  display: inline-block;
-  background: #111;
-  color: #fff !important;
-  text-decoration: none;
-  padding: 9px 14px;
-  border-radius: 9px;
-  font-weight: 600;
-  font-size: 14px;
-  cursor: grab;
-}
-.drag-hint { font-size: 12px; color: var(--muted); margin-left: 10px; }
+.entry-help { color: var(--muted); font-size: 13px; margin-top: 18px; }
 .entry-foot { color: var(--muted); font-size: 13px; }
 .entry-foot a { color: inherit; }
 

@@ -31,18 +31,16 @@ table here.
 
 The fix is to run the editor **inside the target page's own context**, where
 the DOM is fair game. One shared engine ([`public/editor.js`](public/editor.js))
-is delivered three ways:
+is delivered two ways:
 
 | Delivery | Where it runs | Works on | How it's loaded |
 | --- | --- | --- | --- |
-| **Bookmarklet** | The real page in your browser | **Any** site (already logged in) | You click it on the page |
 | **Iframe inject** | An embedded frame | Same-origin / framable sites only | Web app injects it |
-| **Tauri webview** | A native webview | **Any** site | Injected as an init script |
+| **Tauri webview** | A native webview | **Any** site, including logged-in | Injected as an init script |
 
-The web app tries the iframe first and, when the browser blocks it, points you
-at the bookmarklet — which is the honest zero-backend way to get the full
-feature set on arbitrary, logged-in sites. The native app has no iframe limits
-at all.
+The web (GitHub Pages) build works for same-origin and framable pages. Anything
+that blocks framing or needs a login can only be captured in the **native app**,
+whose webview has no cross-origin limit — that's the app's reason to exist.
 
 `Save as PDF` calls `window.print()`, so you get the browser/OS print dialog and
 pick **Save as PDF** (desktop) or share → PDF (iOS). This preserves the page's
@@ -107,7 +105,7 @@ injected ([`src-tauri/src/lib.rs`](src-tauri/src/lib.rs)) → edit → Save as P
 index.html            entry + viewer screens
 src/main.js           web controller: iframe load, cross-origin fallback, Tauri bridge
 src/ui.css            app chrome
-public/editor.js      the shared editing engine (bookmarklet / iframe / native)
+public/editor.js      the shared editing engine (iframe inject / native)
 src-tauri/            Tauri 2 native app
 .github/workflows/    Pages deploy
 ```

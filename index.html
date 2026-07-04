@@ -30,21 +30,11 @@
           <button type="submit">Load</button>
         </form>
         <p class="entry-note" id="entry-error" hidden></p>
-        <details class="entry-help">
-          <summary>Need to log in, or the site won't load here?</summary>
-          <p>
-            Many sites block being embedded, and none can be edited across
-            origins from this page — that's a browser security rule, not a bug.
-            For those (and anything behind a login) use the
-            <strong>bookmarklet</strong>: drag it to your bookmarks bar once,
-            then click it on any page you're already viewing to get the same
-            toolbar right there.
-          </p>
-          <a id="bookmarklet" class="bookmarklet" href="#" onclick="return false">
-            📄 Save as PDF
-          </a>
-          <span class="drag-hint">↑ drag me to your bookmarks bar</span>
-        </details>
+        <p class="entry-help" id="app-note" hidden>
+          Sites that require a login or block embedding can only be edited in
+          the <strong>desktop / iOS app</strong> — the browser can't edit a
+          page from another origin.
+        </p>
       </div>
       <footer class="entry-foot">
         Runs entirely in your browser. Nothing is uploaded.
@@ -69,17 +59,14 @@
         <!-- Shown when the page can't be edited in-frame (cross-origin / blocked). -->
         <div id="blocked" class="blocked" hidden>
           <div class="blocked-card">
-            <h2>This page can't be edited in the frame</h2>
+            <h2>This page can't be edited in the browser</h2>
             <p id="blocked-reason"></p>
             <p>
-              Use the bookmarklet instead — open the page in its own tab
-              (logging in if needed), then click the bookmarklet to get the
-              editing toolbar directly on it.
+              This is a browser security rule: a web page can't read or change
+              another site's content. To capture pages like this — including
+              anything behind a login — use the <strong>desktop or iOS app</strong>,
+              which loads the page in a real webview with no such limit.
             </p>
-            <a id="bookmarklet-2" class="bookmarklet" href="#" onclick="return false">
-              📄 Save as PDF
-            </a>
-            <span class="drag-hint">drag to your bookmarks bar</span>
             <div class="blocked-actions">
               <button id="open-tab" class="ghost">Open page in new tab</button>
             </div>

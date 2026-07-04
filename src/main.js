@@ -1,8 +1,8 @@
 /*
  * www-to-pdf — web app controller
  * Wires the URL-entry screen to the viewer, tries to inject the shared editor
- * engine into the loaded iframe, and falls back to the bookmarklet when the
- * browser's same-origin policy forbids editing the framed page.
+ * engine into the loaded iframe, and directs the user to the native app when
+ * the browser's same-origin policy forbids editing the framed page.
  */
 
 // The editor engine is served as a static asset (see /public/editor.js).
@@ -17,25 +17,20 @@ const frame = $("frame");
 const blocked = $("blocked");
 
 // In the Tauri app we open the target in a real native webview (which can load
-// and edit any origin) rather than an iframe. Detected via the injected global.
-const isTauri = typeof window !== "undefined" && !!window.__TAURI__;
-function tauriInvoke(cmd, args) {
-  return window.__TAURI__.core.invoke(cmd, args);
+// and edit any origin) rather than an iframe. `__TAURI_INTERNALS__` is present
+// in every Tauri webview regardless of the `withGlobalTauri` setting, so it's
+// the reliable signal — `window.__TAURI__` is NOT injected by default in v2.
+const isTauri =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+async function tauriInvoke(cmd, args) {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke(cmd, args);
 }
 
-// ---- bookmarklet ----------------------------------------------------------
-// A tiny loader that appends our editor.js to whatever page it's clicked on.
-// We host the loader inline so it always points at the current deployment.
-function bookmarkletHref() {
-  const loader =
-    "(function(){var s=document.createElement('script');s.src=" +
-    JSON.stringify(EDITOR_URL + "?v=" + Date.now()) +
-    ";document.body.appendChild(s);})();";
-  return "javascript:" + encodeURIComponent(loader);
-}
-for (const id of ["bookmarklet", "bookmarklet-2"]) {
-  const a = $(id);
-  if (a) a.href = bookmarkletHref();
+// Show the "use the app" hint only in the browser build (never in the app).
+if (!isTauri) {
+  const note = $("app-note");
+  if (note) note.hidden = false;
 }
 
 // ---- URL entry ------------------------------------------------------------
@@ -101,8 +96,8 @@ function load(url) {
 function onFrameLoad() {
   clearTimeout(loadTimer);
   // Try to reach into the frame. Cross-origin access throws — that's our
-  // signal that in-frame editing is impossible and we should offer the
-  // bookmarklet instead.
+  // signal that in-frame editing is impossible and we should point the user
+  // to the native app.
   let doc = null;
   try {
     doc = frame.contentDocument || frame.contentWindow.document;
@@ -166,7 +161,7 @@ $("print-btn").addEventListener("click", () => {
     w.print();
   } catch {
     showBlocked(
-      "This page is cross-origin and can't be printed from here. Use the bookmarklet on the page directly."
+      "This page is cross-origin and can't be printed from here. Use the desktop or iOS app to capture it."
     );
   }
 });
