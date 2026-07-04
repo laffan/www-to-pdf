@@ -18,6 +18,10 @@
   }
 }
 * { box-sizing: border-box; }
+/* The `hidden` attribute must win over the display:flex/absolute rules below,
+   otherwise .viewer/.blocked (author rules) beat the UA [hidden] rule and the
+   overlay shows before a URL is ever loaded. */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;
