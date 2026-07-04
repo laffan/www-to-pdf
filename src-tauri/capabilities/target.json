@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "target",
+  "description": "IPC for the target webview so the injected editor can trigger native PDF export. Note: this grants loaded remote pages the ability to call the app's commands (open_target, export_pdf), which is acceptable for a tool whose whole job is loading arbitrary sites you trust enough to log into.",
+  "windows": ["target"],
+  "remote": {
+    "urls": ["http://*", "https://*"]
+  },
+  "permissions": ["core:default", "core:window:allow-close"]
+}

@@ -95,7 +95,7 @@
       hs !== 1 ? headRule : "",
       // The tool's own chrome must never appear in the exported PDF.
       "@media print{",
-      "  #" + NS + "-panel,#" + NS + "-panel *{display:none!important}",
+      "  #" + NS + "-panel,#" + NS + "-panel *,#" + NS + "-toast{display:none!important}",
       "  ." + NS + "-removed{display:none!important}",
       "  #" + NS + "-meta{display:" + (state.meta.show ? "block" : "none") + "!important}",
       "}",
@@ -431,13 +431,59 @@
 
   // ---- export --------------------------------------------------------------
   function exportPdf() {
-    // If a host (web app / Tauri) wants to drive printing itself, let it.
+    // If a host wants to drive export itself, let it.
     if (window.wwwToPdf && typeof window.wwwToPdf.onExport === "function") {
       var handled = window.wwwToPdf.onExport(collect());
       if (handled === true) return;
     }
+
+    // Native app path: WKWebView's window.print() is unreliable, so render a
+    // real PDF through the Tauri `export_pdf` command instead. `__TAURI_INTERNALS__`
+    // is present in every Tauri webview.
+    var internals = window.__TAURI_INTERNALS__;
+    if (internals && typeof internals.invoke === "function") {
+      var panel = document.getElementById(NS + "-panel");
+      if (panel) panel.style.visibility = "hidden"; // keep the toolbar out of the PDF
+      internals
+        .invoke("export_pdf", { title: state.meta.title || document.title || "" })
+        .then(function (path) {
+          toast("Saved PDF → " + path);
+        })
+        .catch(function (e) {
+          toast("PDF export failed: " + e);
+        })
+        .then(function () {
+          if (panel) panel.style.visibility = "";
+        });
+      return;
+    }
+
+    // Web path: the browser's print dialog (choose "Save as PDF").
     window.focus();
     window.print();
+  }
+
+  function toast(msg) {
+    var t = document.getElementById(NS + "-toast");
+    if (!t) {
+      t = el("div", {
+        id: NS + "-toast",
+        style:
+          "position:fixed;left:50%;bottom:22px;transform:translateX(-50%);" +
+          "z-index:2147483647;max-width:80vw;background:#111;color:#fff;" +
+          "padding:11px 16px;border-radius:10px;font:13px system-ui;" +
+          "box-shadow:0 8px 30px rgba(0,0,0,.35);white-space:pre-wrap;" +
+          "word-break:break-all;text-align:center",
+      });
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.style.opacity = "1";
+    clearTimeout(t._timer);
+    t._timer = setTimeout(function () {
+      t.style.transition = "opacity .4s";
+      t.style.opacity = "0";
+    }, 5000);
   }
   function collect() {
     return {

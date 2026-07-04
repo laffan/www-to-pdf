@@ -42,9 +42,23 @@ The web (GitHub Pages) build works for same-origin and framable pages. Anything
 that blocks framing or needs a login can only be captured in the **native app**,
 whose webview has no cross-origin limit — that's the app's reason to exist.
 
-`Save as PDF` calls `window.print()`, so you get the browser/OS print dialog and
-pick **Save as PDF** (desktop) or share → PDF (iOS). This preserves the page's
-real layout and fonts far better than rasterizing to a canvas.
+### Saving the PDF
+
+- **Web build:** `Save as PDF` calls `window.print()` — you pick "Save as PDF"
+  in the browser's print dialog. Real browsers (incl. iPad Safari) support this.
+- **Native app:** `window.print()` is unreliable/absent in WKWebView, so the
+  editor instead calls the native `export_pdf` command, which renders the
+  webview to a true vector PDF via WKWebView's
+  [`createPDF`](https://developer.apple.com/documentation/webkit/wkwebview/createpdf(configuration:completionhandler:))
+  (macOS 11+ / iOS 14+) and saves it to Downloads (desktop) or the app's
+  Documents dir (iOS). Text stays selectable and the full page is captured.
+
+> **Security note:** so the injected toolbar can trigger export, the target
+> webview is granted IPC to the app's commands via a `remote` capability
+> ([`src-tauri/capabilities/target.json`](src-tauri/capabilities/target.json)).
+> That means a loaded page *could* call `open_target`/`export_pdf` — an
+> acceptable tradeoff for a tool whose job is loading sites you trust enough to
+> log into, but tighten the `remote.urls` allowlist if you want to lock it down.
 
 ---
 
