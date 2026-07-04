@@ -8,6 +8,7 @@ Load a page, then use an in-page toolbar to:
 - **Remove elements** (nav bars, cookie banners, ads, footers…) by clicking them
 - **Tune type** — body text size and heading scale
 - **Add a metadata header** (title, URL, author, access date, notes)
+- **Set page margins** — US Letter output with per-side margins
 - **Save as PDF**
 
 It ships as a **web app** (GitHub Pages) and a **native app** (Tauri 2, desktop + iOS/Android).
@@ -44,21 +45,28 @@ whose webview has no cross-origin limit — that's the app's reason to exist.
 
 ### Saving the PDF
 
-- **Web build:** `Save as PDF` calls `window.print()` — you pick "Save as PDF"
-  in the browser's print dialog. Real browsers (incl. iPad Safari) support this.
-- **Native app:** `window.print()` is unreliable/absent in WKWebView, so the
-  editor instead calls the native `export_pdf` command, which renders the
-  webview to a true vector PDF via WKWebView's
-  [`createPDF`](https://developer.apple.com/documentation/webkit/wkwebview/createpdf(configuration:completionhandler:))
-  (macOS 11+ / iOS 14+) and saves it to Downloads (desktop) or the app's
-  Documents dir (iOS). Text stays selectable and the full page is captured.
+Output is **US Letter (8.5 × 11 in)** with adjustable margins (set per-side in
+the toolbar; toggle "Show margin guide" to preview the printable area).
 
-> **Security note:** so the injected toolbar can trigger export, the target
-> webview is granted IPC to the app's commands via a `remote` capability
-> ([`src-tauri/capabilities/target.json`](src-tauri/capabilities/target.json)).
-> That means a loaded page *could* call `open_target`/`export_pdf` — an
-> acceptable tradeoff for a tool whose job is loading sites you trust enough to
-> log into, but tighten the `remote.urls` allowlist if you want to lock it down.
+- **Web build:** `Save as PDF` calls `window.print()` with an injected
+  `@page { size: 8.5in 11in; margin: … }`, so the browser paginates to real
+  Letter sheets. You pick "Save as PDF" in the print dialog. Works in real
+  browsers, including iPad Safari.
+- **Native app:** `window.print()` is unreliable in WKWebView, and app-command
+  IPC from a dynamically-created *remote* webview is denied by Tauri's ACL
+  ([#10317](https://github.com/tauri-apps/tauri/issues/10317)). So the editor
+  signals the app by navigating to a sentinel URL
+  (`https://wwwtopdf.export/?…`); Rust's `on_navigation` hook cancels that
+  navigation (the edited page is untouched) and renders the webview through
+  **AppKit's print pipeline** (`printOperationWithPrintInfo:`, a silent
+  save-to-PDF job) with the chosen Letter paper size and margins. The saved
+  path is reported back into the toolbar's toast via script injection (which,
+  unlike IPC, works on any origin). Saved to Downloads.
+
+> Because the trigger is a navigation (not an IPC command), no remote-IPC
+> capability is needed and loaded pages get no access to app commands.
+> **macOS only for now** — iOS export (via `UIPrintPageRenderer`) is a TODO;
+> the app otherwise runs on iOS.
 
 ---
 

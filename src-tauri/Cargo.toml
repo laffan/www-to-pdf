@@ -22,10 +22,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
 
-# createPDF is an Apple-only API, driven via objc2 message sends.
-[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+# macOS PDF rendering uses AppKit's print pipeline via raw objc2 message sends
+# (only objc2 core — avoids the objc2-app-kit feature-flag chain).
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-block2 = "0.6"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

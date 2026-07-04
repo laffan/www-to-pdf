@@ -30,6 +30,9 @@
     removed: [],        // stack of {el, prev} for undo
     bodyPx: null,       // null = untouched
     headingScale: 1,
+    // US Letter output; margins in inches.
+    margins: { top: 1, right: 1, bottom: 1, left: 1 },
+    marginGuide: false,
     meta: {
       title: document.title || "",
       url: location.href,
@@ -88,15 +91,30 @@
       "h4{font-size:calc(1.1em*" + hs + ")!important}" +
       "h5{font-size:calc(1.0em*" + hs + ")!important}" +
       "h6{font-size:calc(0.9em*" + hs + ")!important}";
+    var m = state.margins;
+    // @page drives the browser print path (web build) and any print-based
+    // native path; US Letter with the user's margins.
+    var pageRule =
+      "@page{size:8.5in 11in;margin:" +
+      m.top + "in " + m.right + "in " + m.bottom + "in " + m.left + "in;}";
+    // On-screen guide: an inset outline showing the printable area.
+    var guideRule = state.marginGuide
+      ? "html{position:relative}html::after{content:'';position:fixed;pointer-events:none;z-index:2147483646;" +
+        "top:" + m.top + "in;right:" + m.right + "in;bottom:" + m.bottom + "in;left:" + m.left + "in;" +
+        "outline:1px dashed #2563eb;outline-offset:0}"
+      : "";
     s.textContent = [
+      pageRule,
       "." + NS + "-removed{display:none!important}",
       "." + NS + "-hi{outline:2px solid #e11d48!important;outline-offset:-2px!important;cursor:crosshair!important;background:rgba(225,29,72,.08)!important}",
       bodyRule,
       hs !== 1 ? headRule : "",
+      guideRule,
       // The tool's own chrome must never appear in the exported PDF.
       "@media print{",
       "  #" + NS + "-panel,#" + NS + "-panel *,#" + NS + "-toast{display:none!important}",
       "  ." + NS + "-removed{display:none!important}",
+      "  html::after{display:none!important}",
       "  #" + NS + "-meta{display:" + (state.meta.show ? "block" : "none") + "!important}",
       "}",
       // On-screen metadata header preview.
@@ -370,6 +388,60 @@
       }
     );
 
+    // page & margins (output is US Letter, 8.5 x 11 in)
+    function marginInput(key) {
+      return el("input", {
+        type: "number",
+        min: "0",
+        max: "3",
+        step: "0.05",
+        value: state.margins[key],
+        style:
+          "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:6px;" +
+          "padding:5px 6px;font:12px system-ui",
+        oninput: function (e) {
+          var v = parseFloat(e.target.value);
+          state.margins[key] = isNaN(v) ? 0 : Math.max(0, Math.min(3, v));
+          render_style();
+        },
+      });
+    }
+    function marginCell(label, key) {
+      return el("label", { style: "display:grid;gap:2px;font-size:10px;color:#71717a" }, [
+        label,
+        marginInput(key),
+      ]);
+    }
+    var marginGrid = el(
+      "div",
+      { style: "display:grid;grid-template-columns:1fr 1fr;gap:6px" },
+      [
+        marginCell("Top (in)", "top"),
+        marginCell("Right (in)", "right"),
+        marginCell("Bottom (in)", "bottom"),
+        marginCell("Left (in)", "left"),
+      ]
+    );
+    var pageLabel = el(
+      "div",
+      { style: "font-size:11px;color:#52525b;margin-bottom:6px;font-weight:600" },
+      ["Page — US Letter (8.5 × 11 in) · margins"]
+    );
+    var guideToggle = el(
+      "label",
+      { style: "display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:8px;font-size:12px;color:#52525b" },
+      [
+        el("input", {
+          type: "checkbox",
+          onchange: function (e) {
+            state.marginGuide = e.target.checked;
+            render_style();
+          },
+        }),
+        el("span", {}, ["Show margin guide"]),
+      ]
+    );
+
     // save
     var saveBtn = el(
       "button",
@@ -379,7 +451,11 @@
     var hint = el(
       "div",
       { style: "font-size:11px;color:#a1a1aa;text-align:center;margin-top:6px" },
-      ["Choose “Save as PDF” in the print dialog"]
+      [
+        window.__TAURI_INTERNALS__
+          ? "Saves a US-Letter PDF to your Downloads"
+          : "Choose “Save as PDF” in the print dialog",
+      ]
     );
 
     function sep() {
@@ -398,6 +474,10 @@
     panel.appendChild(bodySlider);
     panel.appendChild(el("div", { style: "height:8px" }));
     panel.appendChild(headSlider);
+    panel.appendChild(sep());
+    panel.appendChild(pageLabel);
+    panel.appendChild(marginGrid);
+    panel.appendChild(guideToggle);
     panel.appendChild(sep());
     panel.appendChild(saveBtn);
     panel.appendChild(hint);
@@ -430,6 +510,12 @@
   }
 
   // ---- export --------------------------------------------------------------
+  // Sentinel host used to signal the native app. The Rust `on_navigation`
+  // handler recognises it, cancels the navigation (the page is untouched), and
+  // renders this webview to a PDF. Avoids the Tauri IPC ACL entirely, which is
+  // unreliable for dynamically-created remote webviews.
+  var EXPORT_HOST = "wwwtopdf.export";
+
   function exportPdf() {
     // If a host wants to drive export itself, let it.
     if (window.wwwToPdf && typeof window.wwwToPdf.onExport === "function") {
@@ -437,30 +523,28 @@
       if (handled === true) return;
     }
 
-    // Native app path: WKWebView's window.print() is unreliable, so render a
-    // real PDF through the Tauri `export_pdf` command instead. `__TAURI_INTERNALS__`
-    // is present in every Tauri webview.
-    var internals = window.__TAURI_INTERNALS__;
-    if (internals && typeof internals.invoke === "function") {
-      var panel = document.getElementById(NS + "-panel");
-      if (panel) panel.style.visibility = "hidden"; // keep the toolbar out of the PDF
-      internals
-        .invoke("export_pdf", { title: state.meta.title || document.title || "" })
-        .then(function (path) {
-          toast("Saved PDF → " + path);
-        })
-        .catch(function (e) {
-          toast("PDF export failed: " + e);
-        })
-        .then(function () {
-          if (panel) panel.style.visibility = "";
-        });
+    // Native app path (Tauri webview): trigger via a sentinel navigation.
+    if (window.__TAURI_INTERNALS__) {
+      var m = state.margins;
+      var q =
+        "title=" + encodeURIComponent(state.meta.title || document.title || "") +
+        "&mt=" + m.top + "&mr=" + m.right + "&mb=" + m.bottom + "&ml=" + m.left;
+      toast("Rendering PDF…");
+      // Let the toast paint, then hand off to the native handler.
+      setTimeout(function () {
+        window.location.href = "https://" + EXPORT_HOST + "/?" + q;
+      }, 30);
       return;
     }
 
     // Web path: the browser's print dialog (choose "Save as PDF").
     window.focus();
     window.print();
+  }
+
+  // Called by the native side (via webview.eval) once a PDF has been written.
+  function afterExport(ok, message) {
+    toast((ok ? "Saved PDF → " : "PDF export failed: ") + message);
   }
 
   function toast(msg) {
@@ -527,6 +611,8 @@
   window.wwwToPdf.mount = mount;
   window.wwwToPdf.unmount = unmount;
   window.wwwToPdf.state = state;
+  window.wwwToPdf.toast = toast; // native side calls this for progress/errors
+  window.wwwToPdf.afterExport = afterExport;
 
   if (!window.__WWWTOPDF_NO_AUTOMOUNT) {
     if (document.readyState === "loading") {

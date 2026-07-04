@@ -72,7 +72,21 @@ check("metadata header visible", await page.evaluate(() => {
   return m && getComputedStyle(m).display !== "none";
 }));
 
-// 5. unmount removes the panel
+// 5. margins: default @page is US Letter w/ 1in margins, and edits update it
+check("default @page is US Letter, 1in margins", await page.evaluate(() =>
+  document.getElementById("wwwpdf-style").textContent
+    .includes("@page{size:8.5in 11in;margin:1in 1in 1in 1in;}")
+));
+await page.evaluate(() => {
+  const top = document.querySelector('#wwwpdf-panel input[type=number]'); // first = Top
+  top.value = "0.5";
+  top.dispatchEvent(new Event("input"));
+});
+check("margin edit updates @page", await page.evaluate(() =>
+  document.getElementById("wwwpdf-style").textContent.includes("margin:0.5in 1in 1in 1in;")
+));
+
+// 6. unmount removes the panel
 await page.evaluate(() => window.wwwToPdf.unmount());
 check("unmount removes panel", await page.evaluate(() => !document.getElementById("wwwpdf-panel")));
 
