@@ -241,9 +241,22 @@ async function initPreview() {
     const v = parseFloat($(id).value);
     return isNaN(v) ? 0 : Math.max(0, Math.min(3, v));
   };
+  // IMPORTANT: margins ship in BOTH payloads. The page's @page CSS drives
+  // WebKit's print *layout* width, while the native NSPrintInfo margins drive
+  // tile *placement*. If they disagree, text reflows to the wrong width and
+  // gets cropped — so the same values go to apply_settings (CSS) and
+  // render_preview (native).
+  const margins = () => ({
+    top: num("pv-mt"),
+    right: num("pv-mr"),
+    bottom: num("pv-mb"),
+    left: num("pv-ml"),
+  });
   const settings = () => ({
     bodyPx: parseInt($("pv-body").value, 10),
+    lineHeight: parseFloat($("pv-line").value),
     headingScale: parseFloat($("pv-head").value),
+    margins: margins(),
     meta: {
       show: $("pv-meta-on").checked,
       title: val("pv-title"),
@@ -268,11 +281,15 @@ async function initPreview() {
     status.textContent = "";
     try {
       await invoke("apply_settings", { settings: settings() });
+      const m = margins();
       const path = await invoke("render_preview", {
-        mt: num("pv-mt"),
-        mr: num("pv-mr"),
-        mb: num("pv-mb"),
-        ml: num("pv-ml"),
+        mt: m.top,
+        mr: m.right,
+        mb: m.bottom,
+        ml: m.left,
+        header: val("pv-header") || null,
+        footer: val("pv-footer") || null,
+        pageNumbers: $("pv-pagenum").checked,
       });
       frame.src = convertFileSrc(path) + "?t=" + Date.now();
     } catch (e) {
@@ -305,14 +322,19 @@ async function initPreview() {
     $("pv-body-out").textContent = $("pv-body").value + "px";
     scheduleRefresh();
   });
+  $("pv-line").addEventListener("input", () => {
+    $("pv-line-out").textContent = parseFloat($("pv-line").value).toFixed(2);
+    scheduleRefresh();
+  });
   $("pv-head").addEventListener("input", () => {
     $("pv-head-out").textContent =
       Math.round(parseFloat($("pv-head").value) * 100) + "%";
     scheduleRefresh();
   });
-  for (const id of ["pv-mt", "pv-mr", "pv-mb", "pv-ml"]) {
+  for (const id of ["pv-mt", "pv-mr", "pv-mb", "pv-ml", "pv-header", "pv-footer"]) {
     $(id).addEventListener("input", scheduleRefresh);
   }
+  $("pv-pagenum").addEventListener("change", scheduleRefresh);
 
   // Stage 4: save.
   $("pv-save").addEventListener("click", async () => {

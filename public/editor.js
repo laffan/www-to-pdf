@@ -29,6 +29,7 @@
     removeMode: false,
     removed: [],        // stack of {el, prev} for undo
     bodyPx: null,       // null = untouched
+    lineHeight: null,   // null = untouched
     headingScale: 1,
     // US Letter output; margins in inches.
     margins: { top: 1, right: 1, bottom: 1, left: 1 },
@@ -78,10 +79,11 @@
   function render_style() {
     var s = document.getElementById(NS + "-style");
     if (!s) return;
-    var bodyRule = state.bodyPx
-      ? "body, p, li, td, th, blockquote, dd, dt { font-size:" +
-        state.bodyPx +
-        "px !important; line-height:1.6 !important; }"
+    var bodyDecl = "";
+    if (state.bodyPx) bodyDecl += "font-size:" + state.bodyPx + "px !important;";
+    if (state.lineHeight) bodyDecl += "line-height:" + state.lineHeight + " !important;";
+    var bodyRule = bodyDecl
+      ? "body, p, li, td, th, blockquote, dd, dt {" + bodyDecl + "}"
       : "";
     var hs = state.headingScale;
     var headRule =
@@ -92,8 +94,12 @@
       "h5{font-size:calc(1.0em*" + hs + ")!important}" +
       "h6{font-size:calc(0.9em*" + hs + ")!important}";
     var m = state.margins;
-    // @page drives the browser print path (web build) and any print-based
-    // native path; US Letter with the user's margins.
+    // @page carries the margins for BOTH paths. Web: the browser print dialog
+    // honours it directly. Native: WebKit derives the print LAYOUT width from
+    // these margins while NSPrintInfo places the tiles — the preview window
+    // keeps the two in sync by sending the same values to applySettings (here)
+    // and to the native renderer. If they drift apart, text reflows to the
+    // wrong width and gets cropped.
     var pageRule =
       "@page{size:8.5in 11in;margin:" +
       m.top + "in " + m.right + "in " + m.bottom + "in " + m.left + "in;}";
@@ -404,6 +410,20 @@
         return v + "px";
       }
     );
+    var lineSlider = slider(
+      "Line height",
+      1,
+      2.2,
+      1.6,
+      0.05,
+      function (v) {
+        state.lineHeight = parseFloat(v);
+        render_style();
+      },
+      function (v) {
+        return parseFloat(v).toFixed(2);
+      }
+    );
     var headSlider = slider(
       "Heading size",
       0.6,
@@ -500,6 +520,8 @@
     panel.appendChild(sep());
     panel.appendChild(bodySlider);
     panel.appendChild(el("div", { style: "height:8px" }));
+    panel.appendChild(lineSlider);
+    panel.appendChild(el("div", { style: "height:8px" }));
     panel.appendChild(headSlider);
     panel.appendChild(sep());
     panel.appendChild(pageLabel);
@@ -558,6 +580,8 @@
     if (!s) return;
     if (typeof s.bodyPx === "number") state.bodyPx = s.bodyPx;
     else if (s.bodyPx === null) state.bodyPx = null;
+    if (typeof s.lineHeight === "number") state.lineHeight = s.lineHeight;
+    else if (s.lineHeight === null) state.lineHeight = null;
     if (typeof s.headingScale === "number") state.headingScale = s.headingScale;
     if (s.margins) {
       ["top", "right", "bottom", "left"].forEach(function (k) {

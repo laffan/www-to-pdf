@@ -115,6 +115,13 @@ await page.evaluate(() =>
 check("applySettings sets body font", await page.evaluate(() =>
   Math.round(parseFloat(getComputedStyle(document.getElementById("para")).fontSize)) === 18
 ));
+await page.evaluate(() => window.wwwToPdf.applySettings({ lineHeight: 2.0 }));
+check("applySettings sets line height", await page.evaluate(() => {
+  const p = document.getElementById("para");
+  const lh = parseFloat(getComputedStyle(p).lineHeight);
+  const fs = parseFloat(getComputedStyle(p).fontSize);
+  return Math.abs(lh / fs - 2.0) < 0.05;
+}));
 check("applySettings updates @page margins", await page.evaluate(() =>
   document.getElementById("wwwpdf-style").textContent.includes("margin:0.75in")
 ));

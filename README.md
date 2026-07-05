@@ -8,9 +8,10 @@ The native app is a four-stage flow:
 2. **Page editing** — the site opens in a real webview: log in if needed, then
    click elements to remove clutter (nav bars, cookie banners, ads…).
 3. **PDF settings** — a second window shows a live preview that is the *actual
-   generated PDF*, with controls for body/heading size, per-side margins
-   (US Letter output), and a sans-serif metadata header (title, URL, author,
-   access date, notes).
+   generated PDF*, with controls for body size, line height, heading scale,
+   per-side margins (US Letter output), a sans-serif metadata header (title,
+   URL, author, access date, notes), and header/footer text with optional
+   page numbers.
 4. **Save** — a native save dialog on desktop; the share sheet on iOS.
 
 It ships as a **web app** (GitHub Pages) and a **native app** (Tauri 2, desktop + iOS/Android).
@@ -61,6 +62,15 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   print pipeline** (`printOperationWithPrintInfo:`, silent save-to-PDF, run
   asynchronously — the synchronous run deadlocks WKWebView) to a temp file
   shown via the asset protocol. What you see is the real paginated PDF.
+- **Margins, two systems in lock-step:** WebKit derives the print *layout*
+  width from the page's `@page` CSS, while `NSPrintInfo` margins control
+  where each rendered tile is *placed* on the paper. The UI therefore sends
+  the same margin values down both paths; if they ever disagree, text
+  reflows to the wrong width and gets cropped.
+- **Headers/footers/page numbers:** WebKit has no CSS running headers or
+  `@page` counters, so they're stamped onto the finished PDF in Rust
+  (`lopdf`) — drawn in the margin bands in 9pt Helvetica. Pure Rust, so the
+  same code will serve iOS.
 - **Stage 4 save:** a native save dialog (`tauri-plugin-dialog`); the chosen
   location receives a *copy of the previewed file*, so the saved PDF is
   byte-identical to what was on screen. On iOS the same button hands the file

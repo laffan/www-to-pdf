@@ -126,8 +126,15 @@ fn apply_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<
     webview.eval(&js).map_err(|e| e.to_string())
 }
 
-/// Stage 3: render the current state of the target page to the preview PDF.
+/// Stage 3: render the current state of the target page to the preview PDF,
+/// then stamp header/footer/page numbers into the margins.
 /// Returns the file path; the UI displays it via the asset protocol.
+///
+/// MARGIN CONTRACT: WebKit computes the print *layout* width from the @page
+/// CSS injected in the target page, while NSPrintInfo margins control where
+/// each rendered tile is *placed* on the paper. The two must carry the same
+/// values or text reflows to the wrong width and gets cropped — so the UI
+/// sends margins both to apply_settings (CSS) and here (native).
 #[tauri::command]
 async fn render_preview(
     app: tauri::AppHandle,
@@ -135,6 +142,9 @@ async fn render_preview(
     mr: f64,
     mb: f64,
     ml: f64,
+    header: Option<String>,
+    footer: Option<String>,
+    page_numbers: Option<bool>,
 ) -> Result<String, String> {
     let webview = app
         .get_webview_window("target")
@@ -149,7 +159,194 @@ async fn render_preview(
     let out = preview_path();
     let out_str = out.to_string_lossy().into_owned();
     render_pdf(&webview, &m, &out_str).await?;
+
+    let non_empty = |o: &Option<String>| o.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    stamp_header_footer(
+        &out_str,
+        &m,
+        non_empty(&header),
+        non_empty(&footer),
+        page_numbers.unwrap_or(false),
+    )?;
     Ok(out_str)
+}
+
+// ---- header/footer stamping (pure Rust, all platforms) ---------------------
+// WebKit has no support for CSS running headers or @page counters, so page
+// furniture is stamped onto the finished PDF instead. Text is drawn in the
+// margin bands with a standard Helvetica Type1 font.
+
+/// Escape text for a PDF literal string and map it to WinAnsi-safe bytes.
+fn pdf_escape(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for ch in s.chars() {
+        let b: u8 = match ch {
+            '(' | ')' | '\\' => {
+                out.push(b'\\');
+                ch as u8
+            }
+            c if (c as u32) < 128 => c as u8,
+            // Common typographic characters -> WinAnsi codepoints.
+            '\u{2018}' => 0x91,
+            '\u{2019}' => 0x92,
+            '\u{201C}' => 0x93,
+            '\u{201D}' => 0x94,
+            '\u{2013}' => 0x96,
+            '\u{2014}' => 0x97,
+            '\u{00A9}' => 0xA9,
+            c if (c as u32) < 256 => c as u8, // Latin-1 == WinAnsi for most
+            _ => b'?',
+        };
+        out.push(b);
+    }
+    out
+}
+
+/// Stamp header/footer/page numbers into the margins of every page.
+fn stamp_header_footer(
+    path: &str,
+    m: &Margins,
+    header: Option<&str>,
+    footer: Option<&str>,
+    page_numbers: bool,
+) -> Result<(), String> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    if header.is_none() && footer.is_none() && !page_numbers {
+        return Ok(());
+    }
+    let mut doc = Document::load(path).map_err(|e| format!("stamp: load: {e}"))?;
+    let pages = doc.get_pages();
+    let total = pages.len();
+
+    // One shared Helvetica font object for all stamps.
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "Encoding" => "WinAnsiEncoding",
+    });
+
+    const PT_PER_IN: f64 = 72.0;
+    let (lm, rm) = (m.left * PT_PER_IN, m.right * PT_PER_IN);
+    let (tm, bm) = (m.top * PT_PER_IN, m.bottom * PT_PER_IN);
+    const SIZE: f64 = 9.0;
+
+    let page_ids: Vec<_> = pages.into_iter().collect();
+    for (idx, (_no, page_id)) in page_ids.into_iter().enumerate() {
+        // Page dimensions from MediaBox (fall back to US Letter).
+        let (pw, ph) = {
+            let dict = doc.get_dictionary(page_id).map_err(|e| e.to_string())?;
+            match dict.get(b"MediaBox").and_then(|o| o.as_array()) {
+                Ok(mb) if mb.len() == 4 => {
+                    let f = |o: &Object| o.as_float().unwrap_or(0.0) as f64;
+                    (f(&mb[2]) - f(&mb[0]), f(&mb[3]) - f(&mb[1]))
+                }
+                _ => (612.0, 792.0),
+            }
+        };
+
+        add_stamp_font(&mut doc, page_id, font_id)?;
+
+        // Positions sit midway into the margin bands; clamped so zero margins
+        // still land on the page.
+        let header_y = (ph - tm * 0.55 - SIZE * 0.4).min(ph - SIZE).max(SIZE);
+        let footer_y = (bm * 0.45 - SIZE * 0.4).max(6.0);
+        let mut ops: Vec<u8> = b"\nQ q 0.35 0.35 0.35 rg\n".to_vec();
+        let text_at = |x: f64, y: f64, s: &str, ops: &mut Vec<u8>| {
+            ops.extend_from_slice(b"BT /wwwPdfHF ");
+            ops.extend_from_slice(format!("{SIZE} Tf {x:.1} {y:.1} Td (").as_bytes());
+            ops.extend_from_slice(&pdf_escape(s));
+            ops.extend_from_slice(b") Tj ET\n");
+        };
+        if let Some(h) = header {
+            text_at(lm, header_y, h, &mut ops);
+        }
+        if let Some(f) = footer {
+            text_at(lm, footer_y, f, &mut ops);
+        }
+        if page_numbers {
+            let label = format!("{} / {}", idx + 1, total);
+            // Right-align approximately (Helvetica avg glyph ~0.5 em).
+            let est = label.len() as f64 * SIZE * 0.5;
+            text_at(pw - rm - est, footer_y, &label, &mut ops);
+        }
+        ops.extend_from_slice(b"Q\n");
+
+        // Sandwich the existing content: prepend "q" (so any unbalanced state
+        // the page leaves behind is restored by our leading Q), then append
+        // the stamp ops in a clean graphics state.
+        let pre_id = doc.add_object(Stream::new(dictionary! {}, b"q\n".to_vec()));
+        let post_id = doc.add_object(Stream::new(dictionary! {}, ops));
+        let page_dict = doc.get_dictionary_mut(page_id).map_err(|e| e.to_string())?;
+        let contents = page_dict.get(b"Contents").cloned();
+        let new_contents = match contents {
+            Ok(Object::Array(mut arr)) => {
+                arr.insert(0, Object::Reference(pre_id));
+                arr.push(Object::Reference(post_id));
+                Object::Array(arr)
+            }
+            // Any other form (single reference, or a direct stream object) is
+            // preserved in the middle of the sandwich.
+            Ok(single) => Object::Array(vec![
+                Object::Reference(pre_id),
+                single,
+                Object::Reference(post_id),
+            ]),
+            Err(_) => Object::Array(vec![Object::Reference(pre_id), Object::Reference(post_id)]),
+        };
+        page_dict.set("Contents", new_contents);
+    }
+
+    doc.save(path).map_err(|e| format!("stamp: save: {e}"))?;
+    Ok(())
+}
+
+/// Put `font_id` into the page's Resources/Font dict under /wwwPdfHF,
+/// handling direct, referenced, or missing Resources.
+fn add_stamp_font(
+    doc: &mut lopdf::Document,
+    page_id: lopdf::ObjectId,
+    font_id: lopdf::ObjectId,
+) -> Result<(), String> {
+    use lopdf::Object;
+
+    fn set_font(res: &mut lopdf::Dictionary, font_id: lopdf::ObjectId) {
+        let mut fonts = match res.get(b"Font") {
+            Ok(Object::Dictionary(d)) => d.clone(),
+            _ => lopdf::Dictionary::new(),
+        };
+        fonts.set("wwwPdfHF", Object::Reference(font_id));
+        res.set("Font", Object::Dictionary(fonts));
+    }
+
+    let res_entry = doc
+        .get_dictionary(page_id)
+        .map_err(|e| e.to_string())?
+        .get(b"Resources")
+        .cloned();
+    match res_entry {
+        Ok(Object::Reference(res_id)) => {
+            let res = doc.get_dictionary_mut(res_id).map_err(|e| e.to_string())?;
+            set_font(res, font_id);
+        }
+        Ok(Object::Dictionary(mut res)) => {
+            set_font(&mut res, font_id);
+            doc.get_dictionary_mut(page_id)
+                .map_err(|e| e.to_string())?
+                .set("Resources", Object::Dictionary(res));
+        }
+        _ => {
+            // No per-page Resources (may be inherited) — create one with just
+            // our font. WebKit always writes per-page Resources; safety net.
+            let mut res = lopdf::Dictionary::new();
+            set_font(&mut res, font_id);
+            doc.get_dictionary_mut(page_id)
+                .map_err(|e| e.to_string())?
+                .set("Resources", Object::Dictionary(res));
+        }
+    }
+    Ok(())
 }
 
 /// Stage 4: ask where to save (desktop) or share (iOS). The preview file IS
