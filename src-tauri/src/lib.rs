@@ -160,7 +160,9 @@ async fn render_preview(
     let out_str = out.to_string_lossy().into_owned();
     render_pdf(&webview, &m, &out_str).await?;
 
-    let non_empty = |o: &Option<String>| o.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    fn non_empty(o: &Option<String>) -> Option<&str> {
+        o.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
     stamp_header_footer(
         &out_str,
         &m,
