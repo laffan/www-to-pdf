@@ -58,15 +58,21 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   untouched) and opens the PDF-settings window.
 - **Stage 3 preview:** the settings window is *local* UI, so it uses normal
   IPC. Each change is `eval`'d into the target page (fonts/metadata must live
-  in the page DOM to print), then the page is rendered through **AppKit's
-  print pipeline** (`printOperationWithPrintInfo:`, silent save-to-PDF, run
-  asynchronously — the synchronous run deadlocks WKWebView) to a temp file
-  shown via the asset protocol. What you see is the real paginated PDF.
-- **Margins, two systems in lock-step:** WebKit derives the print *layout*
-  width from the page's `@page` CSS, while `NSPrintInfo` margins control
-  where each rendered tile is *placed* on the paper. The UI therefore sends
-  the same margin values down both paths; if they ever disagree, text
-  reflows to the wrong width and gets cropped.
+  in the page DOM to appear in the render), then the page is rendered to a
+  temp PDF shown via the asset protocol. What you see is the real paginated
+  PDF.
+- **Rendering = createPDF + Rust pagination.** WKWebView's
+  `printOperationWithPrintInfo:` derives its layout width and scale from the
+  *printer's* imageable bounds (constant for save-to-PDF) while clipping to
+  the user margins — so custom margins structurally cannot work there
+  (established empirically; three experiments, all consistent). Instead the
+  renderer (1) resizes the webview to the printable width so the live DOM
+  truly reflows, (2) measures content height and every block element's bottom
+  edge via injected JS, (3) captures one tall exact-width PDF with
+  `WKWebView.createPDF`, and (4) slices it into US-Letter pages in pure Rust
+  (`paginate_tall_pdf`, unit-tested by probe), snapping each page break to a
+  measured paragraph gap so text lines are never split. The webview frame and
+  toolbar are restored after capture.
 - **Headers/footers/page numbers:** WebKit has no CSS running headers or
   `@page` counters, so they're stamped onto the finished PDF in Rust
   (`lopdf`) — drawn in the margin bands in 9pt Helvetica. Pure Rust, so the

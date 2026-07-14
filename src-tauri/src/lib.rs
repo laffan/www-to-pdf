@@ -448,42 +448,29 @@ fn sanitize(s: &str) -> String {
     }
 }
 
-// ---- macOS: AppKit print-to-PDF (US Letter, margins, paginated) -----------
+// ---- macOS: createPDF + Rust pagination (US Letter, margins, no clipping) --
 //
-// Two hard-won correctness rules encoded here:
+// WHY NOT printOperationWithPrintInfo: three experiments established that its
+// layout width and scale derive from NSPrintInfo.imageablePageBounds — the
+// PRINTER's printable area, which for save-to-PDF is the full sheet and thus
+// CONSTANT — while clipping follows the user margins. Layout can never track a
+// margin change, so custom margins structurally cannot work in that API.
 //
-// 1. WKWebView paginates print content in a SEPARATE process, serviced by the
-//    main runloop. The synchronous `runOperation` blocks that runloop, so
-//    pagination never converges and the spool file grows without bound
-//    (observed: a 550 MB unopenable PDF and a crash). The operation MUST be
-//    run asynchronously via runOperationModalForWindow:…didRunSelector:, with
-//    completion delivered to a delegate.
-//
-// 2. AppKit string constants are NOT their symbol names at runtime (e.g.
-//    NSPrintJobSavingURL is "NSJobSavingURL"). Hand-writing the literals
-//    silently misses, and AppKit throws up a save dialog because the save job
-//    has no destination. We link the real symbols so the linker guarantees
-//    the values.
-//
-// MARGIN CONTROL: WKWebView's print operation scales the webview's on-screen
-// (viewport-width) layout to fit the printable area (Fit) rather than reflowing
-// to the page width, and caches that scale — so changing a margin moved the
-// placement window but not the content width, clipping the overflow. The fix:
-// resize the webview to the printable width (in CSS px = printable_inches * 96)
-// right before printing, so WebKit re-lays-out to the correct width every time
-// (busting the cache) and Fit then scales by a constant 96->72dpi = 0.75,
-// keeping text at natural size. The frame is restored in the completion.
-
-#[cfg(target_os = "macos")]
-#[link(name = "AppKit", kind = "framework")]
-extern "C" {
-    // NSString* constants (the symbol is a global holding the object pointer).
-    static NSPrintSaveJob: *mut objc2::runtime::AnyObject;
-    static NSPrintJobSavingURL: *mut objc2::runtime::AnyObject;
-}
+// This pipeline controls layout directly instead:
+//   1. resize the WKWebView to the printable width (CSS px = inches * 96) so
+//      the live DOM genuinely reflows;
+//   2. injected JS hides the tool chrome and measures content height plus the
+//      bottom edge of every block element (safe page-break candidates);
+//   3. WKWebView.createPDF renders ONE tall page at exactly that width;
+//   4. paginate_tall_pdf (pure Rust, unit-tested) slices it into US-Letter
+//      pages at the user's margins, snapping breaks to paragraph gaps so no
+//      text line is ever split;
+//   5. the webview frame and chrome are restored.
+// The same createPDF/evaluateJavaScript calls exist on iOS, so this path is
+// mobile-ready.
 
 // Core Graphics geometry, hand-encoded to avoid the objc2-foundation
-// feature-flag chain. Used to read/restore the WKWebView (NSView) frame.
+// feature-flag chain.
 #[cfg(target_os = "macos")]
 mod geom {
     use objc2::encode::{Encode, Encoding};
@@ -517,71 +504,188 @@ mod geom {
     }
 }
 
-/// Payload carried through NSPrintOperation's async completion: the result
-/// channel plus the webview frame size to restore after printing.
-#[cfg(target_os = "macos")]
-struct PrintCtx {
-    tx: tokio::sync::oneshot::Sender<Result<(), String>>,
-    view: usize, // *mut NSView (the WKWebView)
-    restore: geom::CGSize,
+/// Measurements reported by the injected capture-prep script.
+#[derive(serde::Deserialize)]
+struct Meas {
+    /// full document height, CSS px
+    h: f64,
+    /// actual layout width, CSS px (sanity signal: should equal the target)
+    w: f64,
+    /// bottom edges of block elements, CSS px from document top — safe breaks
+    b: Vec<f64>,
 }
 
-/// Completion callback for NSPrintOperation's async run. Restores the webview
-/// frame (widened/narrowed for print) and reports the result.
+/// Runs inside the target page right before capture: hides the toolbar/toast/
+/// margin-guide (createPDF renders SCREEN media, so @media print rules don't
+/// apply here) and measures the document + safe break points.
+const CAPTURE_PREP_JS: &str = r#"(function(){
+  try{
+    var st=document.getElementById('wwwpdf-capture');
+    if(!st){st=document.createElement('style');st.id='wwwpdf-capture';
+      st.textContent='#wwwpdf-panel,#wwwpdf-toast{display:none!important}html::after{display:none!important}';
+      document.documentElement.appendChild(st);}
+    var d=document,b=d.body,e=d.documentElement;
+    var h=Math.max(b?b.scrollHeight:0,e.scrollHeight,b?b.offsetHeight:0,e.offsetHeight);
+    var pts=[];var els=d.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,pre,blockquote,figure,table,img,tr');
+    for(var i=0;i<els.length&&i<8000;i++){var el=els[i];var r=el.getBoundingClientRect();
+      if(!r.height)continue;pts.push(Math.round(r.bottom+window.scrollY));}
+    pts=Array.from(new Set(pts)).sort(function(x,y){return x-y});
+    return JSON.stringify({h:Math.ceil(h),w:Math.round(e.clientWidth),b:pts});
+  }catch(err){return JSON.stringify({h:0,w:0,b:[]})}
+})()"#;
+
+/// Undo CAPTURE_PREP_JS (safe to run repeatedly).
+const CAPTURE_DONE_JS: &str =
+    "(function(){var s=document.getElementById('wwwpdf-capture');if(s)s.remove();})()";
+
+/// Set the WKWebView frame size (width and/or height); returns the previous
+/// size. wry attaches the webview with an autoresizing mask, not Auto Layout
+/// constraints, so a direct setFrameSize sticks until the window resizes.
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn print_did_run(
-    _this: *mut objc2::runtime::AnyObject,
-    _cmd: objc2::runtime::Sel,
-    _op: *mut objc2::runtime::AnyObject,
-    success: objc2::runtime::Bool,
-    context: *mut std::ffi::c_void,
-) {
+async fn set_webview_frame(
+    webview: &tauri::WebviewWindow,
+    w: Option<f64>,
+    h: Option<f64>,
+) -> Result<(f64, f64), String> {
+    use crate::geom::{CGRect, CGSize};
     use objc2::msg_send;
-    if context.is_null() {
-        return;
-    }
-    let ctx = Box::from_raw(context as *mut PrintCtx);
-    let view = ctx.view as *mut objc2::runtime::AnyObject;
-    if !view.is_null() {
-        let _: () = msg_send![view, setFrameSize: ctx.restore];
-    }
-    let _ = ctx.tx.send(if success.as_bool() {
-        Ok(())
-    } else {
-        Err("print operation failed or was cancelled".into())
-    });
+    use objc2::runtime::AnyObject;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(f64, f64), String>>();
+    let tx = std::sync::Mutex::new(Some(tx));
+    webview
+        .with_webview(move |platform| unsafe {
+            let Some(tx) = tx.lock().unwrap().take() else { return };
+            let wk = platform.inner() as *mut AnyObject;
+            if wk.is_null() {
+                let _ = tx.send(Err("webview handle was null".into()));
+                return;
+            }
+            let fr: CGRect = msg_send![wk, frame];
+            let new = CGSize {
+                width: w.unwrap_or(fr.size.width),
+                height: h.unwrap_or(fr.size.height),
+            };
+            let _: () = msg_send![wk, setFrameSize: new];
+            let _ = tx.send(Ok((fr.size.width, fr.size.height)));
+        })
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+        .await
+        .map_err(|_| "frame update timed out".to_string())?
+        .map_err(|_| "frame update dropped".to_string())?
 }
 
-/// Lazily register a one-off Objective-C delegate class + shared instance for
-/// print completions. The instance is stateless (context carries the payload),
-/// so a single leaked object serves every export.
+/// Evaluate JS in the target webview and return its string result. Runs via
+/// the native evaluateJavaScript (works on any origin, bypasses page CSP).
 #[cfg(target_os = "macos")]
-fn print_delegate() -> *mut objc2::runtime::AnyObject {
-    use objc2::runtime::{AnyObject, Bool, ClassBuilder, Sel};
-    use objc2::{class, msg_send, sel};
-    use std::sync::OnceLock;
+async fn eval_js_string(webview: &tauri::WebviewWindow, script: &str) -> Result<String, String> {
+    use block2::RcBlock;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2::class;
 
-    static INSTANCE: OnceLock<usize> = OnceLock::new();
-    *INSTANCE.get_or_init(|| {
-        let mut builder = ClassBuilder::new(c"WwwToPdfPrintDelegate", class!(NSObject))
-            .expect("delegate class name already taken");
-        unsafe {
-            builder.add_method(
-                sel!(printOperationDidRun:success:contextInfo:),
-                print_did_run
-                    as unsafe extern "C" fn(
-                        *mut AnyObject,
-                        Sel,
-                        *mut AnyObject,
-                        Bool,
-                        *mut std::ffi::c_void,
-                    ),
-            );
-        }
-        let cls = builder.register();
-        let obj: *mut AnyObject = unsafe { msg_send![cls, new] };
-        obj as usize
-    }) as *mut objc2::runtime::AnyObject
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let tx = std::sync::Mutex::new(Some(tx));
+    let script = script.to_string();
+    webview
+        .with_webview(move |platform| unsafe {
+            let Some(tx) = tx.lock().unwrap().take() else { return };
+            let wk = platform.inner() as *mut AnyObject;
+            if wk.is_null() {
+                let _ = tx.send(Err("webview handle was null".into()));
+                return;
+            }
+            let c = std::ffi::CString::new(script.as_str()).unwrap_or_default();
+            let ns: *mut AnyObject =
+                msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()];
+            let txc = std::sync::Mutex::new(Some(tx));
+            let block = RcBlock::new(move |result: *mut AnyObject, err: *mut AnyObject| {
+                let Some(tx) = txc.lock().unwrap().take() else { return };
+                if !result.is_null() {
+                    let utf8: *const std::os::raw::c_char = msg_send![result, UTF8String];
+                    let s = if utf8.is_null() {
+                        String::new()
+                    } else {
+                        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                    };
+                    let _ = tx.send(Ok(s));
+                } else if !err.is_null() {
+                    let d: *mut AnyObject = msg_send![err, localizedDescription];
+                    let utf8: *const std::os::raw::c_char = msg_send![d, UTF8String];
+                    let s = if utf8.is_null() {
+                        "JS evaluation failed".to_string()
+                    } else {
+                        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                    };
+                    let _ = tx.send(Err(s));
+                } else {
+                    let _ = tx.send(Err("JS returned no result".into()));
+                }
+            });
+            let _: () = msg_send![wk, evaluateJavaScript: ns, completionHandler: &*block];
+        })
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+        .await
+        .map_err(|_| "JS evaluation timed out".to_string())?
+        .map_err(|_| "JS completion dropped".to_string())?
+}
+
+/// Render the webview's full content to PDF bytes via WKWebView.createPDF
+/// (nil configuration = the whole view; the frame is pre-sized to the full
+/// content height so the whole document is captured).
+#[cfg(target_os = "macos")]
+async fn wk_create_pdf(webview: &tauri::WebviewWindow) -> Result<Vec<u8>, String> {
+    use block2::RcBlock;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Vec<u8>, String>>();
+    let tx = std::sync::Mutex::new(Some(tx));
+    webview
+        .with_webview(move |platform| unsafe {
+            let Some(tx) = tx.lock().unwrap().take() else { return };
+            let wk = platform.inner() as *mut AnyObject;
+            if wk.is_null() {
+                let _ = tx.send(Err("webview handle was null".into()));
+                return;
+            }
+            let txc = std::sync::Mutex::new(Some(tx));
+            let block = RcBlock::new(move |data: *mut AnyObject, err: *mut AnyObject| {
+                let Some(tx) = txc.lock().unwrap().take() else { return };
+                if !data.is_null() {
+                    let len: usize = msg_send![data, length];
+                    let ptr: *const u8 = msg_send![data, bytes];
+                    if ptr.is_null() || len == 0 {
+                        let _ = tx.send(Err("createPDF returned empty data".into()));
+                    } else {
+                        let _ = tx.send(Ok(std::slice::from_raw_parts(ptr, len).to_vec()));
+                    }
+                } else if !err.is_null() {
+                    let d: *mut AnyObject = msg_send![err, localizedDescription];
+                    let utf8: *const std::os::raw::c_char = msg_send![d, UTF8String];
+                    let s = if utf8.is_null() {
+                        "createPDF failed".to_string()
+                    } else {
+                        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                    };
+                    let _ = tx.send(Err(s));
+                } else {
+                    let _ = tx.send(Err("createPDF returned neither data nor error".into()));
+                }
+            });
+            let _: () = msg_send![
+                wk,
+                createPDFWithConfiguration: std::ptr::null_mut::<AnyObject>(),
+                completionHandler: &*block
+            ];
+        })
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(120), rx)
+        .await
+        .map_err(|_| "createPDF timed out".to_string())?
+        .map_err(|_| "createPDF completion dropped".to_string())?
 }
 
 #[cfg(target_os = "macos")]
@@ -590,126 +694,180 @@ async fn render_pdf(
     p: &Margins,
     out_path: &str,
 ) -> Result<(), String> {
-    use crate::geom::{CGRect, CGSize};
-    use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send, sel};
+    use std::time::Duration;
+    const PX_PER_IN: f64 = 96.0;
 
-    const PT_PER_IN: f64 = 72.0;
-    // US Letter, in points.
-    let paper = CGSize { width: 8.5 * PT_PER_IN, height: 11.0 * PT_PER_IN };
-    let (top, right, bottom, left) = (
-        p.top * PT_PER_IN,
-        p.right * PT_PER_IN,
-        p.bottom * PT_PER_IN,
-        p.left * PT_PER_IN,
-    );
-    // The layout width the webview must adopt so the print reflows correctly:
-    // printable width in CSS px (1 CSS px == 1 point in WKWebView, and print
-    // renders 96dpi CSS at 72dpi paper, so px = inches * 96).
-    let printable_w_px = ((8.5 - p.left - p.right).max(1.0)) * 96.0;
-    let out_path_owned = out_path.to_string();
+    // The width the live DOM must reflow to: printable inches at CSS 96dpi.
+    let printable_w_px = ((8.5 - p.left - p.right).max(1.0)) * PX_PER_IN;
+    let raw_path = std::env::temp_dir().join("wwwtopdf-raw.pdf");
+    let raw_str = raw_path.to_string_lossy().into_owned();
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-    let tx = std::sync::Mutex::new(Some(tx));
+    // 1. Reflow to print width (remember the original frame).
+    let (old_w, old_h) = set_webview_frame(webview, Some(printable_w_px), None).await?;
 
-    webview
-        .with_webview(move |platform| {
-            // Runs on the main thread. SAFETY: `inner()`/`ns_window()` are this
-            // webview's live WKWebView/NSWindow; the print operation retains
-            // what it needs, and completion arrives via the delegate above.
-            unsafe {
-                let tx = tx.lock().unwrap().take();
-                let Some(tx) = tx else { return };
-                let wk = platform.inner() as *mut AnyObject;
-                let win = platform.ns_window() as *mut AnyObject;
-                if wk.is_null() || win.is_null() {
-                    let _ = tx.send(Err("webview/window handle was null".into()));
-                    return;
-                }
+    // Everything else runs inside a block so the frame/chrome ALWAYS restore.
+    let captured: Result<Meas, String> = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
 
-                let nsstring = |s: &str| -> *mut AnyObject {
-                    let c = std::ffi::CString::new(s).unwrap_or_default();
-                    msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()]
-                };
+        // 2. Hide chrome + measure (getBoundingClientRect forces fresh layout).
+        let json = eval_js_string(webview, CAPTURE_PREP_JS).await?;
+        let meas: Meas =
+            serde_json::from_str(&json).map_err(|e| format!("bad measurement: {e}"))?;
+        if meas.h < 1.0 || meas.w < 1.0 {
+            return Err("could not measure the page".into());
+        }
 
-                // Resize the webview to the printable width so WebKit re-lays-out
-                // the print content to the correct width (busting the cached
-                // scale that clipped non-default margins). Restored in the
-                // completion. Height is left as-is; only width drives reflow.
-                let old_frame: CGRect = msg_send![wk, frame];
-                let print_size = CGSize {
-                    width: printable_w_px,
-                    height: old_frame.size.height,
-                };
-                let _: () = msg_send![wk, setFrameSize: print_size];
-                let _: () = msg_send![wk, layoutSubtreeIfNeeded];
+        // 3. Grow the frame to the full content height so createPDF captures
+        //    the entire document, then render.
+        set_webview_frame(webview, None, Some(meas.h + 8.0)).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let pdf = wk_create_pdf(webview).await?;
+        std::fs::write(&raw_path, &pdf).map_err(|e| format!("write raw pdf: {e}"))?;
+        Ok(meas)
+    }
+    .await;
 
-                // NSPrintInfo configured for a silent save-to-PDF job.
-                let info: *mut AnyObject = msg_send![class!(NSPrintInfo), new];
-                let _: () = msg_send![info, setPaperSize: paper];
-                let _: () = msg_send![info, setTopMargin: top];
-                let _: () = msg_send![info, setBottomMargin: bottom];
-                let _: () = msg_send![info, setLeftMargin: left];
-                let _: () = msg_send![info, setRightMargin: right];
-                let _: () = msg_send![info, setHorizontallyCentered: false];
-                let _: () = msg_send![info, setVerticallyCentered: false];
-                let _: () = msg_send![info, setHorizontalPagination: 1usize];
-                let _: () = msg_send![info, setVerticalPagination: 0usize];
+    // 4. Restore frame and chrome regardless of outcome.
+    let _ = set_webview_frame(webview, Some(old_w), Some(old_h)).await;
+    let _ = webview.eval(CAPTURE_DONE_JS);
+    let meas = captured?;
 
-                // Save-to-file disposition + destination, via the REAL AppKit
-                // symbols (see note above about literal values).
-                let _: () = msg_send![info, setJobDisposition: NSPrintSaveJob];
-                let dict: *mut AnyObject = msg_send![info, dictionary];
-                let file_url: *mut AnyObject =
-                    msg_send![class!(NSURL), fileURLWithPath: nsstring(&out_path_owned)];
-                let _: () = msg_send![dict, setObject: file_url, forKey: NSPrintJobSavingURL];
+    // 5. Paginate to US Letter at the user's margins (pure Rust).
+    paginate_tall_pdf(&raw_str, out_path, p, &meas)?;
 
-                let op: *mut AnyObject = msg_send![wk, printOperationWithPrintInfo: info];
-                if op.is_null() {
-                    // Restore the frame before bailing.
-                    let _: () = msg_send![wk, setFrameSize: old_frame.size];
-                    let _ = tx.send(Err("could not create print operation".into()));
-                    return;
-                }
-                let _: () = msg_send![op, setShowsPrintPanel: false];
-                let _: () = msg_send![op, setShowsProgressPanel: false];
-
-                // Async run; the delegate's callback fires when WebKit has
-                // finished paginating and the file is written, and restores the
-                // webview frame.
-                let context = Box::into_raw(Box::new(PrintCtx {
-                    tx,
-                    view: wk as usize,
-                    restore: old_frame.size,
-                })) as *mut std::ffi::c_void;
-                let _: () = msg_send![
-                    op,
-                    runOperationModalForWindow: win,
-                    delegate: print_delegate(),
-                    didRunSelector: sel!(printOperationDidRun:success:contextInfo:),
-                    contextInfo: context
-                ];
-            }
-        })
-        .map_err(|e| e.to_string())?;
-
-    // Guard against a completion that never arrives (e.g. WebKit wedges).
-    let result = tokio::time::timeout(std::time::Duration::from_secs(180), rx)
-        .await
-        .map_err(|_| "PDF render timed out after 180s".to_string())?
-        .map_err(|_| "print completion was dropped".to_string())?;
-    result?;
-
-    // The delegate reported success — sanity-check the artifact.
     match std::fs::metadata(out_path) {
         Ok(m) if m.len() > 0 => Ok(()),
-        Ok(_) => Err("print finished but the PDF is empty".into()),
-        Err(_) => Err("print finished but no file was written".into()),
+        _ => Err("pagination produced no output".into()),
     }
 }
 
-// iOS export (UIPrintPageRenderer -> PDF) is not implemented yet; the app runs,
-// but PDF export currently targets macOS.
+/// Slice one tall PDF page into US-Letter pages with the given margins.
+/// Pure Rust (lopdf) and platform-independent; unit-tested by probe.
+///
+/// Geometry: the source page (width Wsrc) is drawn on each output page as a
+/// Form XObject scaled by s = content_width / Wsrc, offset so that slice k's
+/// top lands at the top of the content box, clipped to the content box. Slice
+/// boundaries snap to the nearest measured block-bottom (paragraph gap) at or
+/// above the ideal cut so text lines are never split across pages.
+fn paginate_tall_pdf(
+    src: &str,
+    dst: &str,
+    m: &Margins,
+    meas: &Meas,
+) -> Result<(), String> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::load(src).map_err(|e| format!("paginate: load: {e}"))?;
+    let pages = doc.get_pages();
+    let &src_id = pages.values().next().ok_or("paginate: source has no pages")?;
+
+    // Source page geometry.
+    let src_dict = doc
+        .get_dictionary(src_id)
+        .map_err(|e| e.to_string())?
+        .clone();
+    let (w_src, h_src) = match src_dict.get(b"MediaBox").and_then(|o| o.as_array()) {
+        Ok(mb) if mb.len() == 4 => {
+            let f = |o: &Object| o.as_float().unwrap_or(0.0) as f64;
+            (f(&mb[2]) - f(&mb[0]), f(&mb[3]) - f(&mb[1]))
+        }
+        _ => return Err("paginate: source page has no MediaBox".into()),
+    };
+    if w_src < 1.0 || h_src < 1.0 {
+        return Err("paginate: degenerate source page".into());
+    }
+
+    // Wrap the source page's content + resources in a Form XObject.
+    let content = doc
+        .get_page_content(src_id)
+        .map_err(|e| format!("paginate: content: {e}"))?;
+    let resources_obj = src_dict
+        .get(b"Resources")
+        .cloned()
+        .unwrap_or(Object::Dictionary(lopdf::Dictionary::new()));
+    let parent_id = src_dict
+        .get(b"Parent")
+        .and_then(|o| o.as_reference())
+        .map_err(|_| "paginate: source page has no Parent".to_string())?;
+    let form_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), w_src.into(), h_src.into()],
+            "Resources" => resources_obj,
+        },
+        content,
+    ));
+
+    // Output geometry (US Letter, points).
+    let (pw, ph) = (612.0_f64, 792.0_f64);
+    let (lm, rm) = (m.left * 72.0, m.right * 72.0);
+    let (tm, bm) = (m.top * 72.0, m.bottom * 72.0);
+    let cw = (pw - lm - rm).max(36.0);
+    let ch = (ph - tm - bm).max(36.0);
+    let s = cw / w_src;
+    // CSS px -> source pt (guards against any DPR scaling in the capture).
+    let ratio = w_src / meas.w.max(1.0);
+    let content_h = (meas.h * ratio).min(h_src).max(1.0);
+    let slice_h = ch / s; // source units per output page
+
+    // Page tops (source pt, from document top), snapped to safe breaks.
+    let breaks: Vec<f64> = meas.b.iter().map(|y| y * ratio).collect();
+    let mut tops = vec![0.0_f64];
+    let mut t = 0.0_f64;
+    while t + slice_h < content_h - 1.0 && tops.len() < 500 {
+        let ideal = t + slice_h;
+        // Largest break at/above the cut, but keep at least 40% of a page.
+        let snapped = breaks
+            .iter()
+            .copied()
+            .filter(|y| *y <= ideal - 2.0 && *y > t + slice_h * 0.4)
+            .fold(f64::NAN, f64::max);
+        let next = if snapped.is_nan() { ideal } else { snapped };
+        tops.push(next);
+        t = next;
+    }
+    let n = tops.len();
+
+    // Build the output pages.
+    let mut kids: Vec<Object> = Vec::with_capacity(n);
+    for &t_k in &tops {
+        // Map source band-top to the top of the content box.
+        let ty = (ph - tm) - s * (h_src - t_k);
+        let ops = format!(
+            "q {lm:.2} {bm:.2} {cw:.2} {ch:.2} re W n {s:.6} 0 0 {s:.6} {lm:.2} {ty:.2} cm /Fm0 Do Q"
+        );
+        let cs = doc.add_object(Stream::new(dictionary! {}, ops.into_bytes()));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(parent_id),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Fm0" => Object::Reference(form_id) },
+            },
+            "Contents" => Object::Reference(cs),
+        });
+        kids.push(Object::Reference(page));
+    }
+
+    // Swap the page tree over to the new pages.
+    let pages_dict = doc
+        .get_dictionary_mut(parent_id)
+        .map_err(|e| e.to_string())?;
+    pages_dict.set("Kids", Object::Array(kids));
+    pages_dict.set("Count", Object::Integer(n as i64));
+    pages_dict.set(
+        "MediaBox",
+        vec![0.into(), 0.into(), 612.into(), 792.into()],
+    );
+
+    doc.save(dst).map_err(|e| format!("paginate: save: {e}"))?;
+    Ok(())
+}
+
+// iOS: createPDF/evaluateJavaScript exist there too, so the macOS pipeline
+// above ports directly (UIView frame + UIScrollView contentSize instead of
+// NSView frame). Not wired up yet; the app runs but export targets macOS.
 #[cfg(not(target_os = "macos"))]
 async fn render_pdf(
     _webview: &tauri::WebviewWindow,
