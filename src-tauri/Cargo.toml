@@ -25,11 +25,13 @@ tauri-plugin-dialog = "2"
 # Header/footer/page-number stamping onto rendered PDFs (pure Rust).
 lopdf = "0.43"
 
-# macOS PDF rendering drives WKWebView.createPDF via raw objc2 message sends
-# (objc2 core + block2 for completion handlers — avoids the typed-crate
-# feature-flag chains).
-[target.'cfg(target_os = "macos")'.dependencies]
+# Apple message sends via raw objc2: macOS uses it for the createPDF render
+# pipeline; iOS uses it for the share-sheet (UIActivityViewController) export.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc2 = "0.6"
+
+# block2 completion handlers are only used by the macOS render path so far.
+[target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 
 [features]

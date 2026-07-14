@@ -11,7 +11,10 @@
     "verify": "node scripts/verify-editor.mjs",
     "tauri": "tauri",
     "app:dev": "tauri dev",
-    "app:build": "tauri build"
+    "app:build": "tauri build",
+    "ios:init": "tauri ios init",
+    "ios:dev": "tauri ios dev",
+    "build:ios": "tauri ios build"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0",

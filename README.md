@@ -138,14 +138,6 @@ npm run tauri icon path/to/icon.png
 # desktop
 npm run app:dev
 npm run app:build
-
-# iOS (needs macOS + Xcode)
-npm run tauri ios init
-npm run tauri ios dev
-
-# Android (needs Android SDK/NDK)
-npm run tauri android init
-npm run tauri android dev
 ```
 
 The native flow: enter a URL → Rust opens it in a real webview with the editor
@@ -154,6 +146,41 @@ injected ([`src-tauri/src/lib.rs`](src-tauri/src/lib.rs)) → edit → Save as P
 > Tauri needs the Rust toolchain and platform WebView libraries installed —
 > see <https://tauri.app/start/prerequisites/>. The `icons/icon.png` in this
 > repo is a plain placeholder; replace it with `npm run tauri icon`.
+
+### iOS
+
+```bash
+# one-time prerequisites (macOS only)
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+xcode-select --install          # Xcode + command-line tools
+sudo gem install cocoapods      # or: brew install cocoapods
+
+npm run ios:init                # generates src-tauri/gen/apple/ (the Xcode project)
+npm run ios:dev                 # run on a booted Simulator (easiest) or device
+npm run build:ios               # release build / archive
+```
+
+The `ios` CLI subcommand only exists on macOS, so these run on your Mac. The
+generated `src-tauri/gen/apple/` is git-ignored by default (regenerate with
+`ios:init`); remove it from `.gitignore` if you want to commit native config
+(Info.plist entries, signing). Device builds need a development team — set it
+in Xcode (`gen/apple`) or as `bundle.iOS.developmentTeam` in `tauri.conf.json`.
+
+> **iOS status — builds and launches, but the flow isn't wired for mobile yet.**
+> Two things are macOS-shaped in the current code:
+> 1. **Multi-window.** The desktop flow opens separate *target* and *preview*
+>    windows; Tauri mobile is single-window, so `open_target` won't create a
+>    window on iOS. You'll reach the URL-entry screen, but loading a page needs
+>    a single-window mobile flow (target page + settings as an in-page overlay,
+>    reusing the existing sentinel-navigation channel).
+> 2. **Renderer.** `render_pdf` is macOS-only (createPDF + AppKit frame control);
+>    iOS needs the `UIView`/`UIScrollView` equivalent. The share-sheet export
+>    (`UIActivityViewController`) is already written and will compile now that
+>    `objc2` targets iOS.
+>
+> So `build:ios` is useful today for confirming the toolchain, signing, and
+> that the Rust (including the iOS share-sheet code) compiles for the iOS
+> targets — the groundwork for making the flow functional there.
 
 ## Layout
 
