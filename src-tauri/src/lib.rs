@@ -859,11 +859,21 @@ fn paginate_tall_pdf(
 
     // Build the output pages.
     let mut kids: Vec<Object> = Vec::with_capacity(n);
-    for &t_k in &tops {
+    for (k, &t_k) in tops.iter().enumerate() {
+        // This page's band ends at the NEXT page's (snapped) top — and the
+        // clip must end there too, or the strip between the snapped break and
+        // the full content box shows on BOTH pages (a clipped line at the
+        // bottom of page k duplicated in full at the top of page k+1).
+        let band_end = tops
+            .get(k + 1)
+            .copied()
+            .unwrap_or_else(|| content_h.min(t_k + slice_h));
+        let clip_h = (s * (band_end - t_k)).clamp(1.0, ch);
+        let clip_y0 = (ph - tm) - clip_h;
         // Map source band-top to the top of the content box.
         let ty = (ph - tm) - s * (h_src - t_k);
         let ops = format!(
-            "q {lm:.2} {bm:.2} {cw:.2} {ch:.2} re W n {s:.6} 0 0 {s:.6} {lm:.2} {ty:.2} cm /Fm0 Do Q"
+            "q {lm:.2} {clip_y0:.2} {cw:.2} {clip_h:.2} re W n {s:.6} 0 0 {s:.6} {lm:.2} {ty:.2} cm /Fm0 Do Q"
         );
         let cs = doc.add_object(Stream::new(dictionary! {}, ops.into_bytes()));
         let page = doc.add_object(dictionary! {
