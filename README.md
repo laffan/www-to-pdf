@@ -4,7 +4,7 @@ Capture a website, tidy it up, and save it as a clean PDF.
 
 The native app is a four-stage flow:
 
-1. **URL entry** — type or pick from your recent links.
+1. **URL entry** — type or pick from your recent links (shown with page title).
 2. **Page editing** — the site opens in a real webview: log in if needed, then
    click elements to remove clutter (nav bars, cookie banners, ads…). Removal
    sets can be saved as **presets** and re-applied on later visits — or on
@@ -82,11 +82,13 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   same code will serve iOS.
 - **Removal presets:** each clicked removal records a durable CSS selector
   (nearest sane id, else `tag.stable-classes` path; build-hashed class names
-  are skipped). Presets live in `presets.json` in the app data dir; Rust
-  injects them into the target webview alongside the editor (the remote page
-  has no IPC to ask with), and saves/deletes arrive via the
-  `wwwtopdf.preset` sentinel navigation, which evals the refreshed list back
-  into the toolbar.
+  are skipped). The toolbar shows a dropdown (a preset auto-applies on
+  select; "No Preset" is the neutral top entry) with an "Edit Presets" link
+  that reveals Save new / Update selected / Delete. Presets live in
+  `presets.json` in the app data dir; Rust injects them into the target
+  webview alongside the editor (the remote page has no IPC to ask with), and
+  save/update/delete arrive via the `wwwtopdf.preset` sentinel navigation,
+  which evals the refreshed list back into the toolbar.
 - **Stage 4 save:** a native save dialog (`tauri-plugin-dialog`); the chosen
   location receives a *copy of the previewed file*, so the saved PDF is
   byte-identical to what was on screen. On iOS the same button hands the file

@@ -105,6 +105,23 @@ fn handle_preset_nav(app: &tauri::AppHandle, url: &Url) {
                 format!("Saved preset “{name}” ({n} selectors)")
             }
         }
+        Some("update") => {
+            let id = get("id").unwrap_or_default();
+            let selectors: Vec<String> = get("sels")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            match presets.iter_mut().find(|p| p.id == id) {
+                Some(preset) if !selectors.is_empty() => {
+                    let n = selectors.len();
+                    preset.selectors = selectors;
+                    let name = preset.name.clone();
+                    store_presets(app, &presets);
+                    format!("Updated “{name}” ({n} selectors)")
+                }
+                Some(_) => "Update had no selectors".to_string(),
+                None => "Preset not found".to_string(),
+            }
+        }
         Some("delete") => match get("id") {
             Some(id) => {
                 presets.retain(|p| p.id != id);
@@ -200,11 +217,22 @@ fn stash_page_info(app: &tauri::AppHandle, nav_url: &Url) {
             .map(|(_, v)| v.into_owned())
             .unwrap_or_default()
     };
-    let state = app.state::<AppState>();
-    *state.page.lock().unwrap() = PageInfo {
+    let info = PageInfo {
         title: get("title"),
         url: get("url"),
     };
+    // Backfill the URL-entry history with the real page title (the main window
+    // only had the URL when the user clicked Load).
+    if !info.title.is_empty() && !info.url.is_empty() {
+        if let Some(main) = app.get_webview_window("main") {
+            let u = serde_json::to_string(&info.url).unwrap_or_else(|_| "\"\"".into());
+            let t = serde_json::to_string(&info.title).unwrap_or_else(|_| "\"\"".into());
+            let _ = main.eval(&format!(
+                "window.__wwwpdfSetHistoryTitle&&window.__wwwpdfSetHistoryTitle({u},{t})"
+            ));
+        }
+    }
+    *app.state::<AppState>().page.lock().unwrap() = info;
 }
 
 /// Stage 2 → 3: open (or refresh) the PDF-settings window.

@@ -53,35 +53,69 @@ $("url-form").addEventListener("submit", (e) => {
 });
 
 // ---- history (stage 1) ------------------------------------------------------
+// Entries are { u: url, t: title }. The title arrives later than the URL (once
+// the page has loaded and reported document.title), so it's filled in by
+// setHistoryTitle — from the editor on the web build, or from Rust at the
+// stage-2→3 hand-off in the app.
 const HISTORY_KEY = "wwwpdf:history";
 function readHistory() {
   try {
     const h = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
-    return Array.isArray(h) ? h : [];
+    if (!Array.isArray(h)) return [];
+    // Migrate the old plain-string format.
+    return h.map((e) => (typeof e === "string" ? { u: e, t: "" } : e)).filter((e) => e && e.u);
   } catch {
     return [];
   }
 }
-function pushHistory(url) {
+function writeHistory(h) {
   try {
-    const h = [url, ...readHistory().filter((u) => u !== url)].slice(0, 8);
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
-    renderHistory();
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, 8)));
   } catch {}
 }
+function pushHistory(url) {
+  const existing = readHistory().find((e) => e.u === url);
+  const entry = { u: url, t: existing ? existing.t : "" };
+  writeHistory([entry, ...readHistory().filter((e) => e.u !== url)]);
+  renderHistory();
+}
+function setHistoryTitle(url, title) {
+  title = (title || "").trim();
+  if (!title) return;
+  const h = readHistory();
+  const e = h.find((x) => x.u === url);
+  if (!e || e.t === title) return;
+  e.t = title;
+  writeHistory(h);
+  renderHistory();
+}
+// Called from Rust (app) via eval on the main window.
+window.__wwwpdfSetHistoryTitle = setHistoryTitle;
+
 function renderHistory() {
   const list = $("history");
   if (!list) return;
   list.textContent = "";
-  for (const url of readHistory()) {
+  for (const { u, t } of readHistory()) {
     const li = document.createElement("li");
     const a = document.createElement("a");
     a.href = "#";
-    a.textContent = url;
+    a.title = u;
+    if (t) {
+      const title = document.createElement("span");
+      title.className = "h-title";
+      title.textContent = t;
+      const url = document.createElement("span");
+      url.className = "h-url";
+      url.textContent = u;
+      a.append(title, url);
+    } else {
+      a.textContent = u;
+    }
     a.addEventListener("click", (e) => {
       e.preventDefault();
-      $("url-input").value = url;
-      load(url);
+      $("url-input").value = u;
+      load(u);
     });
     li.appendChild(a);
     list.appendChild(li);
@@ -160,6 +194,8 @@ function onFrameLoad() {
 
 function injectEditor(doc) {
   blocked.hidden = true;
+  // Same-origin frame: we can read the real page title for the history list.
+  setHistoryTitle($("viewer-url").textContent, doc.title || "");
   if (doc.getElementById("wwwpdf-loader")) return; // already injected
   const s = doc.createElement("script");
   s.id = "wwwpdf-loader";

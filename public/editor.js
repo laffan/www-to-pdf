@@ -442,41 +442,47 @@
       var hostKey = function (h) {
         return (h || "").replace(/^www\./, "");
       };
+      var NO_PRESET = "";
+
+      // Dropdown: "No Preset" first, then presets (this-site starred + first).
       var presetSel = el("select", {
         id: NS + "-preset-sel",
         style:
           "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:7px;" +
           "padding:7px 8px;font:12px system-ui;background:#fff;color:#18181b",
+        onchange: function () {
+          var p = currentPreset();
+          if (p) applyPreset(p);
+        },
       });
-      function rebuildPresetOptions() {
-        presetSel.textContent = "";
+      function sortedPresets() {
         var here = hostKey(location.hostname);
-        var sorted = presets.slice().sort(function (a, b) {
+        return presets.slice().sort(function (a, b) {
           var am = hostKey(a.host) === here ? 0 : 1;
           var bm = hostKey(b.host) === here ? 0 : 1;
           if (am !== bm) return am - bm;
           return a.name < b.name ? -1 : 1;
         });
-        if (!sorted.length) {
-          var empty = document.createElement("option");
-          empty.value = "";
-          empty.textContent = "No presets saved yet";
-          presetSel.appendChild(empty);
-          return;
-        }
-        sorted.forEach(function (p) {
+      }
+      function rebuildPresetOptions() {
+        var keep = presetSel.value;
+        presetSel.textContent = "";
+        var here = hostKey(location.hostname);
+        var none = document.createElement("option");
+        none.value = NO_PRESET;
+        none.textContent = "No Preset";
+        presetSel.appendChild(none);
+        sortedPresets().forEach(function (p) {
           var o = document.createElement("option");
           o.value = p.id;
           o.textContent = (hostKey(p.host) === here ? "★ " : "") + p.name;
           presetSel.appendChild(o);
         });
+        // Preserve selection if it still exists, else fall back to No Preset.
+        presetSel.value = presets.some(function (p) { return p.id === keep; })
+          ? keep
+          : NO_PRESET;
       }
-      rebuildPresetOptions();
-      // The app calls this (via eval) after a save/delete round-trips.
-      window.wwwToPdf.presetsUpdated = function (list) {
-        presets = Array.isArray(list) ? list : [];
-        rebuildPresetOptions();
-      };
       function currentPreset() {
         var id = presetSel.value;
         for (var i = 0; i < presets.length; i++) {
@@ -484,60 +490,107 @@
         }
         return null;
       }
-      var applyBtn = el(
-        "button",
-        {
-          style: STYLE_BTN + ";width:auto;flex:1;text-align:center",
-          onclick: function () {
-            var p = currentPreset();
-            if (!p) return toast("No preset selected");
-            applyPreset(p);
-          },
-        },
-        ["Apply"]
-      );
-      var delBtn = el(
-        "button",
-        {
-          title: "Delete selected preset",
-          style: STYLE_BTN + ";width:auto;flex:none;text-align:center",
-          onclick: function () {
-            var p = currentPreset();
-            if (!p) return;
-            window.location.href =
-              "https://" + PRESET_HOST + "/?action=delete&id=" + encodeURIComponent(p.id);
-          },
-        },
-        ["✕"]
-      );
+      function currentSelectors() {
+        var sels = [];
+        state.removed.forEach(function (r) {
+          if (r.sel && sels.indexOf(r.sel) < 0) sels.push(r.sel);
+        });
+        return sels;
+      }
+      function presetNav(params) {
+        window.location.href = "https://" + PRESET_HOST + "/?" + params;
+      }
+
+      // -- collapsible editor (Save new / Update selected / Delete selected) --
       var nameInput = el("input", {
         type: "text",
-        placeholder: "Preset name",
+        placeholder: "New preset name",
         value: hostKey(location.hostname),
         style:
           "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:7px;" +
           "padding:7px 8px;font:12px system-ui",
       });
-      var savePresetBtn = el(
+      var saveBtn = el(
         "button",
         {
           style: STYLE_BTN + ";width:auto;flex:none;text-align:center",
           onclick: function () {
-            var sels = [];
-            state.removed.forEach(function (r) {
-              if (r.sel && sels.indexOf(r.sel) < 0) sels.push(r.sel);
-            });
+            var sels = currentSelectors();
             if (!sels.length) return toast("Click some elements to remove first");
             var name = (nameInput.value || "").trim() || hostKey(location.hostname);
-            window.location.href =
-              "https://" + PRESET_HOST + "/?action=save" +
-              "&name=" + encodeURIComponent(name) +
+            presetNav(
+              "action=save&name=" + encodeURIComponent(name) +
               "&host=" + encodeURIComponent(location.hostname) +
-              "&sels=" + encodeURIComponent(JSON.stringify(sels));
+              "&sels=" + encodeURIComponent(JSON.stringify(sels))
+            );
           },
         },
-        ["Save"]
+        ["Save new"]
       );
+      var updateBtn = el(
+        "button",
+        {
+          title: "Overwrite the selected preset with what's removed now",
+          style: STYLE_BTN + ";text-align:center",
+          onclick: function () {
+            var p = currentPreset();
+            if (!p) return toast("Select a preset to update");
+            var sels = currentSelectors();
+            if (!sels.length) return toast("Nothing removed to save");
+            presetNav(
+              "action=update&id=" + encodeURIComponent(p.id) +
+              "&sels=" + encodeURIComponent(JSON.stringify(sels))
+            );
+          },
+        },
+        ["Update selected"]
+      );
+      var deleteBtn = el(
+        "button",
+        {
+          style: STYLE_BTN + ";text-align:center;color:#dc2626",
+          onclick: function () {
+            var p = currentPreset();
+            if (!p) return toast("Select a preset to delete");
+            presetNav("action=delete&id=" + encodeURIComponent(p.id));
+          },
+        },
+        ["Delete selected"]
+      );
+      var editorBox = el(
+        "div",
+        {
+          id: NS + "-preset-editor",
+          style: "display:none;margin-top:8px;display:none;gap:6px;flex-direction:column",
+        },
+        [
+          el("div", { style: "display:flex;gap:6px" }, [nameInput, saveBtn]),
+          updateBtn,
+          deleteBtn,
+        ]
+      );
+      var editorOpen = false;
+      var editLink = el("a", {
+        href: "#",
+        style:
+          "display:inline-block;margin-top:8px;font-size:11px;color:#2563eb;" +
+          "text-decoration:none;cursor:pointer",
+        onclick: function (e) {
+          e.preventDefault();
+          editorOpen = !editorOpen;
+          editorBox.style.display = editorOpen ? "flex" : "none";
+          editLink.textContent = editorOpen ? "Hide preset editor" : "Edit Presets";
+        },
+      });
+      editLink.textContent = "Edit Presets";
+
+      rebuildPresetOptions();
+      // The app calls this (via eval) after a save/update/delete round-trips.
+      window.wwwToPdf.presetsUpdated = function (list) {
+        presets = Array.isArray(list) ? list : [];
+        rebuildPresetOptions();
+      };
+
       var presetsLabel = el(
         "div",
         { style: "font-size:11px;font-weight:600;color:#52525b;margin-bottom:6px" },
@@ -552,14 +605,8 @@
       panel.appendChild(divider());
       panel.appendChild(presetsLabel);
       panel.appendChild(presetSel);
-      panel.appendChild(el("div", { style: "height:6px" }));
-      panel.appendChild(
-        el("div", { style: "display:flex;gap:6px" }, [applyBtn, delBtn])
-      );
-      panel.appendChild(el("div", { style: "height:6px" }));
-      panel.appendChild(
-        el("div", { style: "display:flex;gap:6px" }, [nameInput, savePresetBtn])
-      );
+      panel.appendChild(editLink);
+      panel.appendChild(editorBox);
       panel.appendChild(divider());
       panel.appendChild(nextBtn);
       return panel;
