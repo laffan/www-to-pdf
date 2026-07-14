@@ -464,6 +464,16 @@ fn sanitize(s: &str) -> String {
 //    silently misses, and AppKit throws up a save dialog because the save job
 //    has no destination. We link the real symbols so the linker guarantees
 //    the values.
+//
+// 3. MARGINS ARE OWNED BY CSS, NOT NSPrintInfo. WebKit already insets the
+//    print layout by the page's `@page` margins (injected + synced by the
+//    editor each render). If NSPrintInfo *also* carries margins, the native
+//    side insets the PLACEMENT a second time: the already-@page-margined
+//    content is dropped into a smaller native window and the overflow is
+//    clipped (the "text reflows an inch past the margin and gets cropped"
+//    bug). So NSPrintInfo margins are ZERO — full-paper placement — and
+//    pagination is Automatic, not Fit (Fit would scale the margined content
+//    back out to fill the whole sheet, cancelling the margins).
 
 #[cfg(target_os = "macos")]
 #[link(name = "AppKit", kind = "framework")]
@@ -528,10 +538,13 @@ fn print_delegate() -> *mut objc2::runtime::AnyObject {
     }) as *mut objc2::runtime::AnyObject
 }
 
+// Margins here are intentionally unused: CSS `@page` owns them (see note 3
+// above). The parameter stays for signature parity with the non-macOS stub and
+// the header/footer stamper.
 #[cfg(target_os = "macos")]
 async fn render_pdf(
     webview: &tauri::WebviewWindow,
-    p: &Margins,
+    _p: &Margins,
     out_path: &str,
 ) -> Result<(), String> {
     use objc2::encode::{Encode, Encoding};
@@ -554,12 +567,6 @@ async fn render_pdf(
     const PT_PER_IN: f64 = 72.0;
     // US Letter, in points.
     let paper = CGSize { width: 8.5 * PT_PER_IN, height: 11.0 * PT_PER_IN };
-    let (top, right, bottom, left) = (
-        p.top * PT_PER_IN,
-        p.right * PT_PER_IN,
-        p.bottom * PT_PER_IN,
-        p.left * PT_PER_IN,
-    );
     let out_path_owned = out_path.to_string();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -588,15 +595,17 @@ async fn render_pdf(
                 // NSPrintInfo configured for a silent save-to-PDF job.
                 let info: *mut AnyObject = msg_send![class!(NSPrintInfo), new];
                 let _: () = msg_send![info, setPaperSize: paper];
-                let _: () = msg_send![info, setTopMargin: top];
-                let _: () = msg_send![info, setBottomMargin: bottom];
-                let _: () = msg_send![info, setLeftMargin: left];
-                let _: () = msg_send![info, setRightMargin: right];
+                // Zero native margins — CSS @page owns the real margins (note 3).
+                let _: () = msg_send![info, setTopMargin: 0.0f64];
+                let _: () = msg_send![info, setBottomMargin: 0.0f64];
+                let _: () = msg_send![info, setLeftMargin: 0.0f64];
+                let _: () = msg_send![info, setRightMargin: 0.0f64];
                 let _: () = msg_send![info, setHorizontallyCentered: false];
                 let _: () = msg_send![info, setVerticallyCentered: false];
-                // NSPrintingPaginationMode: 0=Automatic, 1=Fit, 2=Clip. Fit scales
-                // wide content down to the printable width.
-                let _: () = msg_send![info, setHorizontalPagination: 1usize];
+                // NSPrintingPaginationMode: 0=Automatic, 1=Fit, 2=Clip. Automatic
+                // reflows/paginates at natural size; Fit would scale the
+                // @page-margined content out to fill the whole sheet.
+                let _: () = msg_send![info, setHorizontalPagination: 0usize];
                 let _: () = msg_send![info, setVerticalPagination: 0usize];
 
                 // Save-to-file disposition + destination, via the REAL AppKit
