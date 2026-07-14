@@ -71,8 +71,9 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   edge via injected JS, (3) captures one tall exact-width PDF with
   `WKWebView.createPDF`, and (4) slices it into US-Letter pages in pure Rust
   (`paginate_tall_pdf`, unit-tested by probe), snapping each page break to a
-  measured paragraph gap so text lines are never split. The webview frame and
-  toolbar are restored after capture.
+  measured **text-line boundary** (`Range.getClientRects()` gives one rect per
+  rendered line, so cuts land between lines even inside paragraphs taller
+  than a page). The webview frame and toolbar are restored after capture.
 - **Headers/footers/page numbers:** WebKit has no CSS running headers or
   `@page` counters, so they're stamped onto the finished PDF in Rust
   (`lopdf`) — drawn in the margin bands in 9pt Helvetica. Pure Rust, so the

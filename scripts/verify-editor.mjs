@@ -133,7 +133,48 @@ check("applySettings updates metadata", await page.evaluate(() =>
 await page.evaluate(() => window.wwwToPdf.unmount());
 check("unmount removes panel", await page.evaluate(() => !document.getElementById("wwwpdf-panel")));
 
-// 9. Tauri mode: stage-2 panel is remove-tools + Next only
+// 9. Capture-measurement script (extracted VERBATIM from lib.rs): must report
+// per-LINE break candidates so page cuts never split a text line.
+{
+  const librs = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const m = librs.match(/CAPTURE_PREP_JS: &str = r#"([\s\S]*?)"#;/);
+  check("capture script found in lib.rs", !!m);
+  if (m) {
+    const measPage = await browser.newPage();
+    // A 300px-wide column forces a long paragraph to wrap into many lines.
+    await measPage.setContent(
+      `<div id="wwwpdf-panel">TOOLBAR</div>
+       <div style="width:300px">
+         <p id="longp" style="line-height:1.6">${"lorem ipsum dolor sit amet ".repeat(80)}</p>
+         <img width="100" height="50" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" />
+       </div>`,
+      { waitUntil: "load" }
+    );
+    const res = JSON.parse(await measPage.evaluate(m[1]));
+    const lineCount = await measPage.evaluate(() => {
+      const r = document.createRange();
+      r.selectNodeContents(document.getElementById("longp").firstChild);
+      return r.getClientRects().length;
+    });
+    check("measures document height", res.h > 0 && res.w > 0);
+    check(
+      `reports per-line breaks (${res.b.length} candidates for ${lineCount} lines)`,
+      lineCount > 10 && res.b.length >= lineCount
+    );
+    check("breaks are sorted ascending", res.b.every((v, i, a) => i === 0 || a[i - 1] <= v));
+    check("hides the toolbar during capture", await measPage.evaluate(() =>
+      getComputedStyle(document.getElementById("wwwpdf-panel")).display === "none"
+    ));
+    // Max gap between consecutive candidates inside the paragraph must be
+    // about one line-height — that's what guarantees no mid-line cuts.
+    const gaps = res.b.slice(1).map((v, i) => v - res.b[i]);
+    const maxGapInText = Math.max(...gaps.slice(0, lineCount - 2));
+    check(`line candidates are dense (max gap ${maxGapInText}px)`, maxGapInText <= 40);
+    await measPage.close();
+  }
+}
+
+// 10. Tauri mode: stage-2 panel is remove-tools + Next only
 const page2 = await browser.newPage();
 await page2.setContent(SAMPLE, { waitUntil: "load" });
 await page2.evaluate(() => { window.__TAURI_INTERNALS__ = {}; });

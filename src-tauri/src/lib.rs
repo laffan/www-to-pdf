@@ -518,6 +518,11 @@ struct Meas {
 /// Runs inside the target page right before capture: hides the toolbar/toast/
 /// margin-guide (createPDF renders SCREEN media, so @media print rules don't
 /// apply here) and measures the document + safe break points.
+/// Break candidates are per text LINE, not per block: Range.getClientRects()
+/// yields one rect per rendered line fragment, so the paginator always has a
+/// safe cut within one line-height of the ideal — even inside paragraphs
+/// taller than a page. Line cuts sit at box-bottom + 1px (inside the next
+/// line's top leading) so descenders that overpaint the box edge survive.
 const CAPTURE_PREP_JS: &str = r#"(function(){
   try{
     var st=document.getElementById('wwwpdf-capture');
@@ -526,9 +531,32 @@ const CAPTURE_PREP_JS: &str = r#"(function(){
       document.documentElement.appendChild(st);}
     var d=document,b=d.body,e=d.documentElement;
     var h=Math.max(b?b.scrollHeight:0,e.scrollHeight,b?b.offsetHeight:0,e.offsetHeight);
-    var pts=[];var els=d.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,pre,blockquote,figure,table,img,tr');
-    for(var i=0;i<els.length&&i<8000;i++){var el=els[i];var r=el.getBoundingClientRect();
-      if(!r.height)continue;pts.push(Math.round(r.bottom+window.scrollY));}
+    var sy=window.scrollY||0;
+    var pts=[];
+    // Replaced/atomic content: bottoms are safe cuts.
+    var els=d.querySelectorAll('img,figure,table,video,canvas,svg,pre,tr,li');
+    for(var i=0;i<els.length&&i<8000;i++){var r=els[i].getBoundingClientRect();
+      if(r.height)pts.push(Math.round(r.bottom+sy));}
+    // Every text line box bottom.
+    var csCache=new Map();
+    function usable(p){
+      if(csCache.has(p))return csCache.get(p);
+      var cs=window.getComputedStyle(p);
+      var v=cs.position!=='fixed'&&cs.display!=='none'&&cs.visibility!=='hidden';
+      csCache.set(p,v);return v;
+    }
+    var walker=d.createTreeWalker(b||e,NodeFilter.SHOW_TEXT,null);
+    var range=d.createRange(),node,count=0;
+    while((node=walker.nextNode())&&count<20000){
+      if(!/\S/.test(node.nodeValue))continue;
+      var p=node.parentElement;
+      if(!p||!usable(p))continue;
+      if(p.closest&&p.closest('#wwwpdf-panel'))continue;
+      range.selectNodeContents(node);
+      var rects=range.getClientRects();
+      for(var j=0;j<rects.length;j++){var rr=rects[j];
+        if(rr.height){pts.push(Math.round(rr.bottom+sy+1));count++;}}
+    }
     pts=Array.from(new Set(pts)).sort(function(x,y){return x-y});
     return JSON.stringify({h:Math.ceil(h),w:Math.round(e.clientWidth),b:pts});
   }catch(err){return JSON.stringify({h:0,w:0,b:[]})}
