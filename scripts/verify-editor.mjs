@@ -219,6 +219,12 @@ check("dropdown has No Preset first, host preset starred", await page2.evaluate(
   );
 }));
 
+check("Update link hidden under No Preset", await page2.evaluate(() => {
+  const link = [...document.querySelectorAll("#wwwpdf-panel a")]
+    .find((a) => a.textContent.startsWith("Update "));
+  return !link || getComputedStyle(link).display === "none";
+}));
+
 // Selecting a preset auto-applies it (change event).
 check("selecting a preset auto-applies (no Apply button)", await page2.evaluate(() => {
   const hasApply = [...document.querySelectorAll("#wwwpdf-panel button")]
@@ -251,11 +257,16 @@ check("preset removals undo", await page2.evaluate(() => {
   return !document.getElementById("foot").classList.contains("wwwpdf-removed");
 }));
 
-// Update: overwrites the selected preset with current selectors.
+// Update: a right-aligned "Update <name>" link tied to the selection.
+check("Update link reads 'Update <preset name>'", await page2.evaluate(() =>
+  [...document.querySelectorAll("#wwwpdf-panel a")]
+    .some((a) => a.textContent === "Update Kill nav+footer" &&
+      getComputedStyle(a).display !== "none")
+));
 await page2.evaluate(() => {
   presetNavUrl = null;
-  [...document.querySelectorAll("#wwwpdf-panel button")]
-    .find((b) => b.textContent === "Update selected").click();
+  [...document.querySelectorAll("#wwwpdf-panel a")]
+    .find((a) => a.textContent.startsWith("Update ")).click();
 });
 await page2.waitForTimeout(200);
 check("Update sends action=update with id + selectors", (() => {

@@ -335,7 +335,7 @@
           "cursor:move;margin:-4px -4px 8px;padding:4px 4px 8px;border-bottom:1px solid #ececf0;user-select:none",
       },
       [
-        el("strong", { style: "font-size:13px" }, ["www → pdf"]),
+        el("strong", { style: "font-size:13px" }, ["Prepare source"]),
         el(
           "button",
           {
@@ -451,6 +451,7 @@
           "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:7px;" +
           "padding:7px 8px;font:12px system-ui;background:#fff;color:#18181b",
         onchange: function () {
+          refreshUpdateLink();
           var p = currentPreset();
           if (p) applyPreset(p);
         },
@@ -527,24 +528,6 @@
         },
         ["Save new"]
       );
-      var updateBtn = el(
-        "button",
-        {
-          title: "Overwrite the selected preset with what's removed now",
-          style: STYLE_BTN + ";text-align:center",
-          onclick: function () {
-            var p = currentPreset();
-            if (!p) return toast("Select a preset to update");
-            var sels = currentSelectors();
-            if (!sels.length) return toast("Nothing removed to save");
-            presetNav(
-              "action=update&id=" + encodeURIComponent(p.id) +
-              "&sels=" + encodeURIComponent(JSON.stringify(sels))
-            );
-          },
-        },
-        ["Update selected"]
-      );
       var deleteBtn = el(
         "button",
         {
@@ -561,41 +544,75 @@
         "div",
         {
           id: NS + "-preset-editor",
-          style: "display:none;margin-top:8px;display:none;gap:6px;flex-direction:column",
+          style: "display:none;gap:6px;flex-direction:column;margin-top:8px",
         },
         [
           el("div", { style: "display:flex;gap:6px" }, [nameInput, saveBtn]),
-          updateBtn,
           deleteBtn,
         ]
       );
+
+      var LINK_STYLE =
+        "font:11px system-ui;color:#2563eb;text-decoration:none;cursor:pointer";
       var editorOpen = false;
-      var editLink = el("a", {
+      var editLink = el(
+        "a",
+        {
+          href: "#",
+          style: LINK_STYLE,
+          onclick: function (e) {
+            e.preventDefault();
+            editorOpen = !editorOpen;
+            editorBox.style.display = editorOpen ? "flex" : "none";
+            editLink.textContent = editorOpen ? "Hide preset editor" : "Edit Presets";
+          },
+        },
+        ["Edit Presets"]
+      );
+      // Right-aligned twin of Edit Presets: overwrite the selected preset with
+      // what's removed now. Hidden when "No Preset" is selected.
+      var updateLink = el("a", {
         href: "#",
-        style:
-          "display:inline-block;margin-top:8px;font-size:11px;color:#2563eb;" +
-          "text-decoration:none;cursor:pointer",
+        style: LINK_STYLE,
         onclick: function (e) {
           e.preventDefault();
-          editorOpen = !editorOpen;
-          editorBox.style.display = editorOpen ? "flex" : "none";
-          editLink.textContent = editorOpen ? "Hide preset editor" : "Edit Presets";
+          var p = currentPreset();
+          if (!p) return;
+          var sels = currentSelectors();
+          if (!sels.length) return toast("Nothing removed to save");
+          presetNav(
+            "action=update&id=" + encodeURIComponent(p.id) +
+            "&sels=" + encodeURIComponent(JSON.stringify(sels))
+          );
         },
       });
-      editLink.textContent = "Edit Presets";
+      function refreshUpdateLink() {
+        var p = currentPreset();
+        if (p) {
+          updateLink.textContent = "Update " + p.name;
+          updateLink.style.display = "";
+        } else {
+          updateLink.style.display = "none";
+        }
+      }
+      var linkRow = el(
+        "div",
+        {
+          style:
+            "display:flex;align-items:center;justify-content:space-between;" +
+            "gap:10px;margin-top:8px",
+        },
+        [editLink, updateLink]
+      );
 
       rebuildPresetOptions();
+      refreshUpdateLink();
       // The app calls this (via eval) after a save/update/delete round-trips.
       window.wwwToPdf.presetsUpdated = function (list) {
         presets = Array.isArray(list) ? list : [];
         rebuildPresetOptions();
+        refreshUpdateLink();
       };
-
-      var presetsLabel = el(
-        "div",
-        { style: "font-size:11px;font-weight:600;color:#52525b;margin-bottom:6px" },
-        ["Presets — saved removal sets"]
-      );
 
       panel.appendChild(bar);
       panel.appendChild(removeBtn);
@@ -603,9 +620,8 @@
       panel.appendChild(removeRow);
       panel.appendChild(count);
       panel.appendChild(divider());
-      panel.appendChild(presetsLabel);
       panel.appendChild(presetSel);
-      panel.appendChild(editLink);
+      panel.appendChild(linkRow);
       panel.appendChild(editorBox);
       panel.appendChild(divider());
       panel.appendChild(nextBtn);
