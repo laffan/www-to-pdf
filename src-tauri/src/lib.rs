@@ -465,12 +465,14 @@ fn sanitize(s: &str) -> String {
 //    has no destination. We link the real symbols so the linker guarantees
 //    the values.
 //
-// KNOWN LIMITATION: this NSPrintInfo path scales the webview's on-screen
-// (viewport-width) layout to fit the printable area (Fit) rather than
-// reflowing to the page width, and caches that scale — so changing a margin
-// moves the placement window but not the content width, clipping the overflow.
-// Margins beyond the default therefore don't work reliably here; the fix is to
-// move rendering to createPDF + explicit pagination (in progress).
+// MARGIN CONTROL: WKWebView's print operation scales the webview's on-screen
+// (viewport-width) layout to fit the printable area (Fit) rather than reflowing
+// to the page width, and caches that scale — so changing a margin moved the
+// placement window but not the content width, clipping the overflow. The fix:
+// resize the webview to the printable width (in CSS px = printable_inches * 96)
+// right before printing, so WebKit re-lays-out to the correct width every time
+// (busting the cache) and Fit then scales by a constant 96->72dpi = 0.75,
+// keeping text at natural size. The frame is restored in the completion.
 
 #[cfg(target_os = "macos")]
 #[link(name = "AppKit", kind = "framework")]
@@ -480,8 +482,52 @@ extern "C" {
     static NSPrintJobSavingURL: *mut objc2::runtime::AnyObject;
 }
 
-/// Completion callback for NSPrintOperation's async run. `contextInfo` carries
-/// a boxed oneshot sender for the result.
+// Core Graphics geometry, hand-encoded to avoid the objc2-foundation
+// feature-flag chain. Used to read/restore the WKWebView (NSView) frame.
+#[cfg(target_os = "macos")]
+mod geom {
+    use objc2::encode::{Encode, Encoding};
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGPoint {
+        pub x: f64,
+        pub y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGSize {
+        pub width: f64,
+        pub height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGRect {
+        pub origin: CGPoint,
+        pub size: CGSize,
+    }
+    unsafe impl Encode for CGPoint {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
+    unsafe impl Encode for CGSize {
+        const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+    }
+    unsafe impl Encode for CGRect {
+        const ENCODING: Encoding =
+            Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
+    }
+}
+
+/// Payload carried through NSPrintOperation's async completion: the result
+/// channel plus the webview frame size to restore after printing.
+#[cfg(target_os = "macos")]
+struct PrintCtx {
+    tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    view: usize, // *mut NSView (the WKWebView)
+    restore: geom::CGSize,
+}
+
+/// Completion callback for NSPrintOperation's async run. Restores the webview
+/// frame (widened/narrowed for print) and reports the result.
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn print_did_run(
     _this: *mut objc2::runtime::AnyObject,
@@ -490,13 +536,16 @@ unsafe extern "C" fn print_did_run(
     success: objc2::runtime::Bool,
     context: *mut std::ffi::c_void,
 ) {
+    use objc2::msg_send;
     if context.is_null() {
         return;
     }
-    let tx = Box::from_raw(
-        context as *mut tokio::sync::oneshot::Sender<Result<(), String>>,
-    );
-    let _ = tx.send(if success.as_bool() {
+    let ctx = Box::from_raw(context as *mut PrintCtx);
+    let view = ctx.view as *mut objc2::runtime::AnyObject;
+    if !view.is_null() {
+        let _: () = msg_send![view, setFrameSize: ctx.restore];
+    }
+    let _ = ctx.tx.send(if success.as_bool() {
         Ok(())
     } else {
         Err("print operation failed or was cancelled".into())
@@ -541,22 +590,9 @@ async fn render_pdf(
     p: &Margins,
     out_path: &str,
 ) -> Result<(), String> {
-    use objc2::encode::{Encode, Encoding};
+    use crate::geom::{CGRect, CGSize};
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send, sel};
-
-    // Minimal CGSize so we can pass NSPrintInfo.paperSize by value without the
-    // objc2-foundation feature-flag chain.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CGSize {
-        width: f64,
-        height: f64,
-    }
-    unsafe impl Encode for CGSize {
-        const ENCODING: Encoding =
-            Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
-    }
 
     const PT_PER_IN: f64 = 72.0;
     // US Letter, in points.
@@ -567,6 +603,10 @@ async fn render_pdf(
         p.bottom * PT_PER_IN,
         p.left * PT_PER_IN,
     );
+    // The layout width the webview must adopt so the print reflows correctly:
+    // printable width in CSS px (1 CSS px == 1 point in WKWebView, and print
+    // renders 96dpi CSS at 72dpi paper, so px = inches * 96).
+    let printable_w_px = ((8.5 - p.left - p.right).max(1.0)) * 96.0;
     let out_path_owned = out_path.to_string();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -592,6 +632,18 @@ async fn render_pdf(
                     msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()]
                 };
 
+                // Resize the webview to the printable width so WebKit re-lays-out
+                // the print content to the correct width (busting the cached
+                // scale that clipped non-default margins). Restored in the
+                // completion. Height is left as-is; only width drives reflow.
+                let old_frame: CGRect = msg_send![wk, frame];
+                let print_size = CGSize {
+                    width: printable_w_px,
+                    height: old_frame.size.height,
+                };
+                let _: () = msg_send![wk, setFrameSize: print_size];
+                let _: () = msg_send![wk, layoutSubtreeIfNeeded];
+
                 // NSPrintInfo configured for a silent save-to-PDF job.
                 let info: *mut AnyObject = msg_send![class!(NSPrintInfo), new];
                 let _: () = msg_send![info, setPaperSize: paper];
@@ -614,6 +666,8 @@ async fn render_pdf(
 
                 let op: *mut AnyObject = msg_send![wk, printOperationWithPrintInfo: info];
                 if op.is_null() {
+                    // Restore the frame before bailing.
+                    let _: () = msg_send![wk, setFrameSize: old_frame.size];
                     let _ = tx.send(Err("could not create print operation".into()));
                     return;
                 }
@@ -621,8 +675,13 @@ async fn render_pdf(
                 let _: () = msg_send![op, setShowsProgressPanel: false];
 
                 // Async run; the delegate's callback fires when WebKit has
-                // finished paginating and the file is written.
-                let context = Box::into_raw(Box::new(tx)) as *mut std::ffi::c_void;
+                // finished paginating and the file is written, and restores the
+                // webview frame.
+                let context = Box::into_raw(Box::new(PrintCtx {
+                    tx,
+                    view: wk as usize,
+                    restore: old_frame.size,
+                })) as *mut std::ffi::c_void;
                 let _: () = msg_send![
                     op,
                     runOperationModalForWindow: win,
