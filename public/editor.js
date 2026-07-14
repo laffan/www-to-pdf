@@ -190,7 +190,9 @@
     var t = e.target;
     t.classList.remove(NS + "-hi");
     t.classList.add(NS + "-removed");
-    state.removed.push(t);
+    // Record a durable selector alongside the node so the removal set can be
+    // saved as a preset and replayed on a fresh load of a similar page.
+    state.removed.push({ el: t, sel: cssPath(t) });
     updateCounts();
   }
   function panelContains(node) {
@@ -206,16 +208,95 @@
     if (!on) onOut();
   }
   function undo() {
-    var t = state.removed.pop();
-    if (t) t.classList.remove(NS + "-removed");
+    var r = state.removed.pop();
+    if (r) r.el.classList.remove(NS + "-removed");
     updateCounts();
   }
   function resetRemoved() {
-    state.removed.forEach(function (t) {
-      t.classList.remove(NS + "-removed");
+    state.removed.forEach(function (r) {
+      r.el.classList.remove(NS + "-removed");
     });
     state.removed = [];
     updateCounts();
+  }
+
+  // ---- durable selectors + presets -------------------------------------------
+  // Class names with digits are usually build-hashed (css-1x2y3z) and won't
+  // survive a redeploy, so only letter-ish classes anchor selectors.
+  function stableClasses(node) {
+    var out = [];
+    var cls = node.classList || [];
+    for (var i = 0; i < cls.length && out.length < 3; i++) {
+      var c = cls[i];
+      if (c.indexOf(NS) === 0) continue;
+      if (!/^[A-Za-z][A-Za-z_-]{2,29}$/.test(c)) continue;
+      out.push(c);
+    }
+    return out;
+  }
+  // Short, human-legible path: nearest sane id, else tag.classes segments with
+  // nth-of-type only when a segment has no stable classes.
+  function cssPath(node) {
+    try {
+      var SAFE_ID = /^[A-Za-z][\w-]{0,63}$/;
+      if (node.id && SAFE_ID.test(node.id)) return "#" + node.id;
+      var parts = [];
+      var cur = node;
+      var depth = 0;
+      while (cur && cur.nodeType === 1 && cur.tagName !== "BODY" && cur.tagName !== "HTML" && depth < 5) {
+        if (cur.id && SAFE_ID.test(cur.id)) {
+          parts.unshift("#" + cur.id);
+          break;
+        }
+        var seg = cur.localName;
+        var sc = stableClasses(cur);
+        if (sc.length) {
+          seg += "." + sc.join(".");
+        } else if (cur.parentElement) {
+          var idx = 1;
+          var sib = cur;
+          while ((sib = sib.previousElementSibling)) {
+            if (sib.localName === cur.localName) idx++;
+          }
+          seg += ":nth-of-type(" + idx + ")";
+        }
+        parts.unshift(seg);
+        cur = cur.parentElement;
+        depth++;
+      }
+      return parts.length ? parts.join(" > ") : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Apply a saved preset: remove everything its selectors match, feeding the
+  // normal removed-stack so Undo/Reset keep working.
+  function applyPreset(preset) {
+    var applied = 0;
+    (preset.selectors || []).forEach(function (sel) {
+      var nodes;
+      try {
+        nodes = document.querySelectorAll(sel);
+      } catch (e) {
+        return; // selector no longer valid on this page — skip
+      }
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (panelContains(n)) continue;
+        if (n === document.body || n === document.documentElement) continue;
+        if (n.classList.contains(NS + "-removed")) continue;
+        n.classList.add(NS + "-removed");
+        state.removed.push({ el: n, sel: sel });
+        applied++;
+      }
+    });
+    updateCounts();
+    toast(
+      applied
+        ? "Removed " + applied + " element" + (applied > 1 ? "s" : "")
+        : "No matching elements on this page"
+    );
   }
   function updateCounts() {
     var c = document.getElementById(NS + "-count");
@@ -353,11 +434,132 @@
       var divider = function () {
         return el("div", { style: "height:1px;background:#ececf0;margin:10px 0" });
       };
+
+      // -- presets: saved removal sets, injected by the app at load time --
+      var presets = Array.isArray(window.__WWWPDF_PRESETS)
+        ? window.__WWWPDF_PRESETS
+        : [];
+      var hostKey = function (h) {
+        return (h || "").replace(/^www\./, "");
+      };
+      var presetSel = el("select", {
+        id: NS + "-preset-sel",
+        style:
+          "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:7px;" +
+          "padding:7px 8px;font:12px system-ui;background:#fff;color:#18181b",
+      });
+      function rebuildPresetOptions() {
+        presetSel.textContent = "";
+        var here = hostKey(location.hostname);
+        var sorted = presets.slice().sort(function (a, b) {
+          var am = hostKey(a.host) === here ? 0 : 1;
+          var bm = hostKey(b.host) === here ? 0 : 1;
+          if (am !== bm) return am - bm;
+          return a.name < b.name ? -1 : 1;
+        });
+        if (!sorted.length) {
+          var empty = document.createElement("option");
+          empty.value = "";
+          empty.textContent = "No presets saved yet";
+          presetSel.appendChild(empty);
+          return;
+        }
+        sorted.forEach(function (p) {
+          var o = document.createElement("option");
+          o.value = p.id;
+          o.textContent = (hostKey(p.host) === here ? "★ " : "") + p.name;
+          presetSel.appendChild(o);
+        });
+      }
+      rebuildPresetOptions();
+      // The app calls this (via eval) after a save/delete round-trips.
+      window.wwwToPdf.presetsUpdated = function (list) {
+        presets = Array.isArray(list) ? list : [];
+        rebuildPresetOptions();
+      };
+      function currentPreset() {
+        var id = presetSel.value;
+        for (var i = 0; i < presets.length; i++) {
+          if (presets[i].id === id) return presets[i];
+        }
+        return null;
+      }
+      var applyBtn = el(
+        "button",
+        {
+          style: STYLE_BTN + ";width:auto;flex:1;text-align:center",
+          onclick: function () {
+            var p = currentPreset();
+            if (!p) return toast("No preset selected");
+            applyPreset(p);
+          },
+        },
+        ["Apply"]
+      );
+      var delBtn = el(
+        "button",
+        {
+          title: "Delete selected preset",
+          style: STYLE_BTN + ";width:auto;flex:none;text-align:center",
+          onclick: function () {
+            var p = currentPreset();
+            if (!p) return;
+            window.location.href =
+              "https://" + PRESET_HOST + "/?action=delete&id=" + encodeURIComponent(p.id);
+          },
+        },
+        ["✕"]
+      );
+      var nameInput = el("input", {
+        type: "text",
+        placeholder: "Preset name",
+        value: hostKey(location.hostname),
+        style:
+          "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:7px;" +
+          "padding:7px 8px;font:12px system-ui",
+      });
+      var savePresetBtn = el(
+        "button",
+        {
+          style: STYLE_BTN + ";width:auto;flex:none;text-align:center",
+          onclick: function () {
+            var sels = [];
+            state.removed.forEach(function (r) {
+              if (r.sel && sels.indexOf(r.sel) < 0) sels.push(r.sel);
+            });
+            if (!sels.length) return toast("Click some elements to remove first");
+            var name = (nameInput.value || "").trim() || hostKey(location.hostname);
+            window.location.href =
+              "https://" + PRESET_HOST + "/?action=save" +
+              "&name=" + encodeURIComponent(name) +
+              "&host=" + encodeURIComponent(location.hostname) +
+              "&sels=" + encodeURIComponent(JSON.stringify(sels));
+          },
+        },
+        ["Save"]
+      );
+      var presetsLabel = el(
+        "div",
+        { style: "font-size:11px;font-weight:600;color:#52525b;margin-bottom:6px" },
+        ["Presets — saved removal sets"]
+      );
+
       panel.appendChild(bar);
       panel.appendChild(removeBtn);
       panel.appendChild(el("div", { style: "height:6px" }));
       panel.appendChild(removeRow);
       panel.appendChild(count);
+      panel.appendChild(divider());
+      panel.appendChild(presetsLabel);
+      panel.appendChild(presetSel);
+      panel.appendChild(el("div", { style: "height:6px" }));
+      panel.appendChild(
+        el("div", { style: "display:flex;gap:6px" }, [applyBtn, delBtn])
+      );
+      panel.appendChild(el("div", { style: "height:6px" }));
+      panel.appendChild(
+        el("div", { style: "display:flex;gap:6px" }, [nameInput, savePresetBtn])
+      );
       panel.appendChild(divider());
       panel.appendChild(nextBtn);
       return panel;
@@ -565,6 +767,9 @@
   // Sentinel navigation avoids the Tauri IPC ACL entirely, which is unreliable
   // for dynamically-created remote webviews.
   var STAGE3_HOST = "wwwtopdf.stage3";
+  // Preset save/delete travels the same way (query carries the payload); the
+  // app intercepts, persists to disk, and calls presetsUpdated back via eval.
+  var PRESET_HOST = "wwwtopdf.preset";
 
   function gotoStage3() {
     setRemoveMode(false);

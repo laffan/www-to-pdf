@@ -39,6 +39,10 @@ check(
     () => getComputedStyle(document.getElementById("nav")).display === "none"
   )
 );
+check("removal records a selector that resolves back to the element", await page.evaluate(() => {
+  const r = window.wwwToPdf.state.removed[0];
+  return !!r && !!r.sel && document.querySelector(r.sel) === r.el;
+}));
 
 // 3. body font size applies
 await page.evaluate(() => {
@@ -174,10 +178,22 @@ check("unmount removes panel", await page.evaluate(() => !document.getElementByI
   }
 }
 
-// 10. Tauri mode: stage-2 panel is remove-tools + Next only
+// 10. Tauri mode: stage-2 panel is remove-tools + presets + Next
 const page2 = await browser.newPage();
+// Capture preset save/delete sentinel navigations instead of failing them.
+let presetNavUrl = null;
+await page2.route("https://wwwtopdf.preset/**", (route) => {
+  presetNavUrl = route.request().url();
+  route.abort("aborted");
+});
 await page2.setContent(SAMPLE, { waitUntil: "load" });
-await page2.evaluate(() => { window.__TAURI_INTERNALS__ = {}; });
+await page2.evaluate(() => {
+  window.__TAURI_INTERNALS__ = {};
+  window.__WWWPDF_PRESETS = [
+    { id: "p2", name: "Another site", host: "other.example", selectors: [".zzz"] },
+    { id: "p1", name: "Kill nav+footer", host: location.hostname, selectors: ["#nav", "#foot"] },
+  ];
+});
 await page2.addScriptTag({ content: EDITOR });
 check("tauri panel has Next button", await page2.evaluate(() =>
   [...document.querySelectorAll("#wwwpdf-panel button")].some((b) =>
@@ -190,6 +206,61 @@ check("tauri panel has no sliders/save", await page2.evaluate(() =>
     b.textContent.includes("Save as PDF")
   )
 ));
+
+// 11. Presets: listed with this-site preset first, apply removes elements,
+// save round-trips the recorded selectors through the sentinel URL.
+check("presets listed, matching host first", await page2.evaluate(() => {
+  const opts = [...document.querySelectorAll("#wwwpdf-preset-sel option")];
+  return (
+    opts.length === 2 &&
+    opts[0].textContent.startsWith("★") &&
+    opts[0].textContent.includes("Kill nav+footer")
+  );
+}));
+await page2.evaluate(() => {
+  document.getElementById("wwwpdf-preset-sel").value = "p1";
+  [...document.querySelectorAll("#wwwpdf-panel button")]
+    .find((b) => b.textContent === "Apply")
+    .click();
+});
+check("apply preset removes matching elements", await page2.evaluate(() =>
+  document.getElementById("nav").classList.contains("wwwpdf-removed") &&
+  document.getElementById("foot").classList.contains("wwwpdf-removed") &&
+  document.getElementById("wwwpdf-count").textContent === "2 removed"
+));
+check("preset removals can be undone", await page2.evaluate(() => {
+  window.wwwToPdf.state.removeMode = false;
+  const undoBtn = [...document.querySelectorAll("#wwwpdf-panel button")]
+    .find((b) => b.textContent === "Undo");
+  undoBtn.click();
+  return !document.getElementById("foot").classList.contains("wwwpdf-removed");
+}));
+await page2.evaluate(() => {
+  const inputs = [...document.querySelectorAll("#wwwpdf-panel input[type=text]")];
+  inputs[0].value = "My preset";
+  [...document.querySelectorAll("#wwwpdf-panel button")]
+    .find((b) => b.textContent === "Save")
+    .click();
+});
+await page2.waitForTimeout(300);
+check("save preset navigates the sentinel with recorded selectors", (() => {
+  if (!presetNavUrl) return false;
+  const u = new URL(presetNavUrl);
+  const sels = JSON.parse(u.searchParams.get("sels") || "[]");
+  return (
+    u.hostname === "wwwtopdf.preset" &&
+    u.searchParams.get("action") === "save" &&
+    u.searchParams.get("name") === "My preset" &&
+    sels.includes("#nav")
+  );
+})());
+check("presetsUpdated refreshes the list", await page2.evaluate(() => {
+  window.wwwToPdf.presetsUpdated([
+    { id: "x", name: "Fresh", host: "a.example", selectors: ["p"] },
+  ]);
+  const opts = [...document.querySelectorAll("#wwwpdf-preset-sel option")];
+  return opts.length === 1 && opts[0].textContent.includes("Fresh");
+}));
 
 await browser.close();
 

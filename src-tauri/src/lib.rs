@@ -25,6 +25,104 @@ const EDITOR_JS: &str = include_str!("../../public/editor.js");
 
 // The editor navigates here when stage 2 is done; see editor.js (STAGE3_HOST).
 const STAGE3_HOST: &str = "wwwtopdf.stage3";
+// Preset save/delete requests arrive the same way (editor.js PRESET_HOST).
+const PRESET_HOST: &str = "wwwtopdf.preset";
+
+/// A saved removal set: CSS selectors recorded when elements were clicked,
+/// replayable on any page with similar markup. Stored in the app data dir;
+/// injected into the target webview alongside the editor at load time.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Preset {
+    id: String,
+    name: String,
+    host: String,
+    selectors: Vec<String>,
+}
+
+fn presets_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let dir = app.path().app_data_dir().ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("presets.json"))
+}
+
+fn load_presets(app: &tauri::AppHandle) -> Vec<Preset> {
+    presets_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn store_presets(app: &tauri::AppHandle, presets: &[Preset]) {
+    if let Some(p) = presets_path(app) {
+        if let Ok(json) = serde_json::to_string_pretty(presets) {
+            let _ = std::fs::write(p, json);
+        }
+    }
+}
+
+/// Presets as a JS expression (valid JSON is valid JS, modulo U+2028/9).
+fn presets_json_for_js(presets: &[Preset]) -> String {
+    serde_json::to_string(presets)
+        .unwrap_or_else(|_| "[]".into())
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Handle a preset save/delete sentinel navigation, then push the updated
+/// list (and a toast) back into the toolbar via eval.
+fn handle_preset_nav(app: &tauri::AppHandle, url: &Url) {
+    let get = |k: &str| -> Option<String> {
+        url.query_pairs()
+            .find(|(q, _)| q == k)
+            .map(|(_, v)| v.into_owned())
+    };
+    let mut presets = load_presets(app);
+    let msg = match get("action").as_deref() {
+        Some("save") => {
+            let selectors: Vec<String> = get("sels")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            if selectors.is_empty() {
+                "Preset had no selectors".to_string()
+            } else {
+                let name = get("name").unwrap_or_else(|| "Preset".into());
+                let host = get("host").unwrap_or_default();
+                let id = format!(
+                    "p{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
+                );
+                let n = selectors.len();
+                presets.push(Preset {
+                    id,
+                    name: name.clone(),
+                    host,
+                    selectors,
+                });
+                store_presets(app, &presets);
+                format!("Saved preset “{name}” ({n} selectors)")
+            }
+        }
+        Some("delete") => match get("id") {
+            Some(id) => {
+                presets.retain(|p| p.id != id);
+                store_presets(app, &presets);
+                "Preset deleted".to_string()
+            }
+            None => "Missing preset id".to_string(),
+        },
+        _ => return,
+    };
+    if let Some(w) = app.get_webview_window("target") {
+        let json = presets_json_for_js(&presets);
+        let msg_js = serde_json::to_string(&msg).unwrap_or_else(|_| "\"\"".into());
+        let _ = w.eval(&format!(
+            "window.wwwToPdf&&(window.wwwToPdf.presetsUpdated&&window.wwwToPdf.presetsUpdated({json}),window.wwwToPdf.toast&&window.wwwToPdf.toast({msg_js}))"
+        ));
+    }
+}
 
 #[derive(Clone, Default, serde::Serialize)]
 struct PageInfo {
@@ -57,9 +155,17 @@ fn open_target(app: tauri::AppHandle, url: String) -> Result<(), String> {
     let parsed: Url = url.parse().map_err(|e| format!("Invalid URL: {e}"))?;
     let app_for_nav = app.clone();
 
+    // Saved presets ride along with the editor so the toolbar can list them
+    // immediately (the remote page has no IPC to ask with).
+    let init_script = format!(
+        "window.__WWWPDF_PRESETS = {};\n{}",
+        presets_json_for_js(&load_presets(&app)),
+        EDITOR_JS
+    );
+
     WebviewWindowBuilder::new(&app, "target", WebviewUrl::External(parsed))
         .title("www → pdf — page")
-        .initialization_script(EDITOR_JS)
+        .initialization_script(init_script)
         .inner_size(1024.0, 768.0)
         .on_navigation(move |nav_url| {
             if nav_url.host_str() == Some(STAGE3_HOST) {
@@ -69,6 +175,14 @@ fn open_target(app: tauri::AppHandle, url: String) -> Result<(), String> {
                     open_preview(&app);
                 });
                 return false; // cancel — the edited page stays put
+            }
+            if nav_url.host_str() == Some(PRESET_HOST) {
+                let app = app_for_nav.clone();
+                let url = nav_url.clone();
+                tauri::async_runtime::spawn(async move {
+                    handle_preset_nav(&app, &url);
+                });
+                return false;
             }
             true
         })
