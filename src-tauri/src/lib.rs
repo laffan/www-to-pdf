@@ -3,8 +3,9 @@
 // SINGLE WINDOW, PANE PROGRESSION (works on desktop AND iOS, which forbids
 // multiple windows). There is one webview:
 //   1. it starts on the bundled URL-entry page (index.html);
-//   2. `load_url` navigates that same webview to the target site, where the
-//      editor init-script mounts an in-page toolbar (Pane 1: remove/presets →
+//   2. the URL-entry page navigates that same webview to the target site (a
+//      plain location.href change), where the editor init-script mounts an
+//      in-page toolbar (Pane 1: remove/presets →
 //      Pane 2: fonts/metadata/margins/header-footer);
 //   3. the toolbar's Preview/Save/New-URL/preset actions are sentinel
 //      navigations the on_navigation hook cancels and turns into native work
@@ -173,25 +174,14 @@ fn report(app: &tauri::AppHandle, ok: bool, msg: &str) {
     }
 }
 
-/// Navigate the single webview to a target URL (remembering the current app
-/// page as "home"). Called from the URL-entry UI, which has working IPC.
-#[tauri::command]
-fn load_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    let parsed: Url = url.parse().map_err(|e| format!("Invalid URL: {e}"))?;
-    let webview = app
-        .get_webview_window("main")
-        .ok_or_else(|| "main window missing".to_string())?;
-    if let Ok(cur) = webview.url() {
-        *app.state::<AppState>().home.lock().unwrap() = Some(cur);
-    }
-    webview.navigate(parsed).map_err(|e| e.to_string())
-}
-
-/// Navigate back to the URL-entry page.
+/// Navigate back to the URL-entry page. Uses a page-driven `location.href`
+/// change (the same proven mechanism the sentinels use) rather than the
+/// native `navigate` API.
 fn go_home(app: &tauri::AppHandle) {
     let home = app.state::<AppState>().home.lock().unwrap().clone();
     if let (Some(webview), Some(u)) = (app.get_webview_window("main"), home) {
-        let _ = webview.navigate(u);
+        let target = serde_json::to_string(u.as_str()).unwrap_or_else(|_| "\"/\"".into());
+        let _ = webview.eval(&format!("window.location.href = {target}"));
     }
 }
 
@@ -1053,7 +1043,6 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![load_url])
         .setup(|app| {
             // The one and only window/webview: starts on the bundled URL-entry
             // page, then navigates to target sites in place. The editor engine
@@ -1074,16 +1063,25 @@ pub fn run() {
                 .initialization_script(init)
                 .on_navigation(move |url| !handle_sentinel(&nav_handle, url))
                 .on_page_load(move |_wv, payload| {
-                    // Push the current presets to each freshly-loaded page so a
-                    // page opened after a preset change isn't stuck with the
-                    // startup snapshot from the init script.
-                    if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
-                        if let Some(w) = load_handle.get_webview_window("main") {
-                            let json = presets_json_for_js(&load_presets(&load_handle));
-                            let _ = w.eval(&format!(
-                                "window.wwwToPdf&&window.wwwToPdf.presetsUpdated&&window.wwwToPdf.presetsUpdated({json})"
-                            ));
+                    if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                        return;
+                    }
+                    // The first page that finishes loading is our own URL-entry
+                    // page; remember it as "home" so "New URL" can return here.
+                    {
+                        let mut home = load_handle.state::<AppState>().home.lock().unwrap();
+                        if home.is_none() {
+                            *home = Some(payload.url().clone());
                         }
+                    }
+                    // Push current presets to each freshly-loaded page so a page
+                    // opened after a preset change isn't stuck with the startup
+                    // snapshot from the init script.
+                    if let Some(w) = load_handle.get_webview_window("main") {
+                        let json = presets_json_for_js(&load_presets(&load_handle));
+                        let _ = w.eval(&format!(
+                            "window.wwwToPdf&&window.wwwToPdf.presetsUpdated&&window.wwwToPdf.presetsUpdated({json})"
+                        ));
                     }
                 })
                 .build()?;

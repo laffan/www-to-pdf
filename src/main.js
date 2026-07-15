@@ -135,12 +135,13 @@ function load(url) {
   $("entry-error").hidden = true;
   pushHistory(url);
 
-  // Native app: hand the URL to Rust, which navigates this single webview to
-  // the page (the injected editor takes over there). No iframe, no limits.
+  // Native app: navigate this single webview to the page in place. Use a
+  // plain top-level navigation — the same mechanism the editor's sentinels
+  // use, so it's known to work here — rather than a Rust command. The editor
+  // init-script takes over on the loaded page. Rust captures the app page as
+  // "home" (see on_page_load) so "New URL" can return.
   if (isTauri) {
-    tauriInvoke("load_url", { url }).catch((e) =>
-      showEntryError("Could not open page: " + e)
-    );
+    window.location.assign(url);
     return;
   }
 
