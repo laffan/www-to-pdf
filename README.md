@@ -192,18 +192,18 @@ generated `src-tauri/gen/apple/` is git-ignored by default (regenerate with
 (Info.plist entries, signing). Device builds need a development team — set it
 in Xcode (`gen/apple`) or as `bundle.iOS.developmentTeam` in `tauri.conf.json`.
 
-> **iOS status — architected for it, not yet verified on a device.** Both
-> former blockers are addressed: the app is now single-window (a pane
-> progression, no `target`/`preview` windows), and the renderer is shared by
-> macOS and iOS. What remains is on-device reality-checking, since none of the
-> Apple code can be compiled off a Mac. Likely first things to shake out:
-> whether `setFrame:` on the iOS `WKWebView` sticks (it may fight the view
-> controller's layout), the share sheet's popover anchoring on iPad, the file
-> paths (`$TEMP`) matching the asset-protocol scope, and whether the phone
-> bottom-sheet's `env(safe-area-inset-*)` values actually resolve (they need a
-> `viewport-fit=cover` viewport, which the editor appends only when the page
-> already ships a viewport meta). Paste any build or runtime error and it's
-> usually a small fix.
+> **iOS status — runs on device; being hardened.** The core flow (load, edit,
+> inline pdf.js preview, render, share) works on iPhone and iPad. Device fixes
+> applied so far: the webview fills the screen and tracks rotation/Stage-Manager
+> resizes (`fit_webview_to_superview` pins it to its superview with a flexible
+> autoresizing mask; `inner_size` is desktop-only), navigations are deferred out
+> of the tap's activation window so a site with an installed app (Substack, …)
+> loads in-app instead of being hijacked by a Universal Link, and the shared PDF
+> is named after the page title. Still worth watching: the share sheet's popover
+> anchoring on iPad, and whether the phone bottom-sheet's `env(safe-area-inset-*)`
+> values resolve (they need a `viewport-fit=cover` viewport, which the editor
+> appends only when the page already ships a viewport meta). Paste any build or
+> runtime error and it's usually a small fix.
 
 ## Layout
 

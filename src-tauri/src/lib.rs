@@ -489,8 +489,15 @@ async fn present_save(
     }
     #[cfg(target_os = "ios")]
     {
-        let _ = suggested;
-        ios_share(app, src)?;
+        // The share sheet / "Save to Files" names the file after its basename,
+        // so hand it a copy named for the page title rather than the internal
+        // "wwwtopdf-preview" scratch file. Stay inside the $TEMP asset scope.
+        let dest = std::env::temp_dir().join(format!("{}.pdf", sanitize(suggested)));
+        let share_path = match std::fs::copy(src, &dest) {
+            Ok(_) => dest.to_string_lossy().into_owned(),
+            Err(_) => src.to_string(), // fall back to the scratch file
+        };
+        ios_share(app, &share_path)?;
         return Ok(None);
     }
     #[cfg(not(target_os = "ios"))]
@@ -791,6 +798,36 @@ async fn set_webview_frame(
         .await
         .map_err(|_| "frame update timed out".to_string())?
         .map_err(|_| "frame update dropped".to_string())?
+}
+
+/// iOS: size the WKWebView to its superview and let UIKit keep it there.
+/// wry attaches the webview with an autoresizing mask (not Auto Layout), so its
+/// initial frame can be a fixed size smaller than the screen. Setting the frame
+/// to the superview bounds plus a flexible width/height mask makes it fill and
+/// follow rotation / multitasking resizes. Guarded so a not-yet-laid-out view
+/// (zero bounds) is left alone rather than collapsed.
+#[cfg(target_os = "ios")]
+fn fit_webview_to_superview(webview: &tauri::WebviewWindow) {
+    use crate::geom::CGRect;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let _ = webview.with_webview(|platform| unsafe {
+        let wk = platform.inner() as *mut AnyObject;
+        if wk.is_null() {
+            return;
+        }
+        let sv: *mut AnyObject = msg_send![wk, superview];
+        if sv.is_null() {
+            return;
+        }
+        let b: CGRect = msg_send![sv, bounds];
+        if b.size.width > 1.0 && b.size.height > 1.0 {
+            let _: () = msg_send![wk, setFrame: b];
+            // UIViewAutoresizingFlexibleWidth (2) | FlexibleHeight (16) = 18.
+            let _: () = msg_send![wk, setAutoresizingMask: 18usize];
+        }
+    });
 }
 
 /// Evaluate JS in the target webview and return its string result. Runs via
@@ -1121,36 +1158,67 @@ pub fn run() {
             );
             let nav_handle = handle.clone();
             let load_handle = handle.clone();
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                .title("Prepare source")
-                .inner_size(1100.0, 800.0)
-                .min_inner_size(380.0, 480.0)
-                .initialization_script(init)
-                .on_navigation(move |url| !handle_sentinel(&nav_handle, url))
-                .on_page_load(move |_wv, payload| {
-                    if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
-                        return;
-                    }
-                    // The first page that finishes loading is our own URL-entry
-                    // page; remember it as "home" so "New URL" can return here.
-                    {
-                        let state = load_handle.state::<AppState>();
-                        let mut home = state.home.lock().unwrap();
-                        if home.is_none() {
-                            *home = Some(payload.url().clone());
+            // `mut` is only used on desktop (inner_size below); mobile keeps it as-is.
+            #[allow(unused_mut)]
+            let mut builder =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("Prepare source")
+                    .initialization_script(init)
+                    .on_navigation(move |url| !handle_sentinel(&nav_handle, url))
+                    .on_page_load(move |_wv, payload| {
+                        if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                            return;
+                        }
+                        // The first page that finishes loading is our own
+                        // URL-entry page; remember it as "home" so "New URL"
+                        // can return here.
+                        {
+                            let state = load_handle.state::<AppState>();
+                            let mut home = state.home.lock().unwrap();
+                            if home.is_none() {
+                                *home = Some(payload.url().clone());
+                            }
+                        }
+                        // Push current presets to each freshly-loaded page so a
+                        // page opened after a preset change isn't stuck with the
+                        // startup snapshot from the init script.
+                        if let Some(w) = load_handle.get_webview_window("main") {
+                            let json = presets_json_for_js(&load_presets(&load_handle));
+                            let _ = w.eval(&format!(
+                                "window.wwwToPdf&&window.wwwToPdf.presetsUpdated&&window.wwwToPdf.presetsUpdated({json})"
+                            ));
+                        }
+                    });
+            // Desktop gets an initial + minimum window size. On mobile the window
+            // is the whole device screen; forcing an inner_size there leaves the
+            // webview a fixed 1100x800 box pinned to the top-left instead of
+            // filling the screen (the iPad "content in the corner" bug).
+            #[cfg(desktop)]
+            {
+                builder = builder.inner_size(1100.0, 800.0).min_inner_size(380.0, 480.0);
+            }
+            builder.build()?;
+
+            // iOS: make the webview actually fill its container and track
+            // rotation / Stage-Manager resizes. wry's initial frame can be
+            // smaller than the screen; pin it to the superview bounds with a
+            // flexible autoresizing mask once the view hierarchy is laid out.
+            #[cfg(target_os = "ios")]
+            {
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Re-fit a few times: the view hierarchy may not be laid out
+                    // on the first tick, and a launch-time rotation can change
+                    // the bounds. Each call is idempotent (and no-ops on a
+                    // not-yet-sized view).
+                    for delay in [300u64, 900, 2000] {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        if let Some(w) = h.get_webview_window("main") {
+                            fit_webview_to_superview(&w);
                         }
                     }
-                    // Push current presets to each freshly-loaded page so a page
-                    // opened after a preset change isn't stuck with the startup
-                    // snapshot from the init script.
-                    if let Some(w) = load_handle.get_webview_window("main") {
-                        let json = presets_json_for_js(&load_presets(&load_handle));
-                        let _ = w.eval(&format!(
-                            "window.wwwToPdf&&window.wwwToPdf.presetsUpdated&&window.wwwToPdf.presetsUpdated({json})"
-                        ));
-                    }
-                })
-                .build()?;
+                });
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

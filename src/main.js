@@ -161,8 +161,16 @@ function load(url) {
   // init-script takes over on the loaded page. Rust captures the app page as
   // "home" (see on_page_load) so "New URL" can return. The bar stays up until
   // the webview swaps in the freshly loaded document (this page unloads).
+  //
+  // Defer the navigation out of the click's user-activation window (a macrotask
+  // break). Inside that window iOS treats the load as a user-initiated link and
+  // can hand the URL to an installed app via a Universal Link (e.g. the Substack
+  // app launches and our webview is left on a load that never completes). A
+  // deferred, non-activated navigation loads the page in our own webview.
   if (isTauri) {
-    window.location.assign(url);
+    setTimeout(function () {
+      window.location.assign(url);
+    }, 0);
     return;
   }
 
