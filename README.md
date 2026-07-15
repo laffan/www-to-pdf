@@ -63,6 +63,13 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   navigates to target sites *in place* (`load_url`). The editor engine is an
   init script that runs on every page and mounts its toolbar on remote pages
   (it suppresses itself on our own page via `__WWWPDF_IS_APP`).
+- **Responsive toolbar.** On tablets/desktop the toolbar is a floating card in
+  the top-right corner. On a phone (viewport ≤ 480px, e.g. iPhone portrait)
+  that card would eclipse the page/preview, so it docks as a full-width
+  **bottom sheet** with an internal scroll, keeping the page (Edit) or the PDF
+  preview (Format) visible above it. Safe-area insets (`env(safe-area-inset-*)`,
+  enabled by appending `viewport-fit=cover` to the page's existing viewport
+  meta) keep the primary action clear of the home indicator / notch.
 - **Sentinel navigations, not IPC.** A remote page has no working Tauri IPC
   (ACL, [#10317](https://github.com/tauri-apps/tauri/issues/10317)), so the
   toolbar signals the app by navigating to a sentinel host the `on_navigation`
@@ -191,9 +198,12 @@ in Xcode (`gen/apple`) or as `bundle.iOS.developmentTeam` in `tauri.conf.json`.
 > macOS and iOS. What remains is on-device reality-checking, since none of the
 > Apple code can be compiled off a Mac. Likely first things to shake out:
 > whether `setFrame:` on the iOS `WKWebView` sticks (it may fight the view
-> controller's layout), the share sheet's popover anchoring on iPad, and the
-> file paths (`$TEMP`) matching the asset-protocol scope. Paste any build or
-> runtime error and it's usually a small fix.
+> controller's layout), the share sheet's popover anchoring on iPad, the file
+> paths (`$TEMP`) matching the asset-protocol scope, and whether the phone
+> bottom-sheet's `env(safe-area-inset-*)` values actually resolve (they need a
+> `viewport-fit=cover` viewport, which the editor appends only when the page
+> already ships a viewport meta). Paste any build or runtime error and it's
+> usually a small fix.
 
 ## Layout
 

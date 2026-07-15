@@ -465,6 +465,52 @@ await appPage.close();
   await pvPage.close();
 }
 
+// 17. Phone form factor: the toolbar docks as a full-width bottom sheet so the
+// preview stays visible above it (rather than a floating card that covers it).
+{
+  const phone = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  await phone.route("https://wwwtopdf.export/**", (route) => route.abort("aborted"));
+  await phone.setContent(SAMPLE, { waitUntil: "load" });
+  await phone.evaluate(() => { window.__TAURI_INTERNALS__ = {}; window.__WWWPDF_PRESETS = []; });
+  await phone.addScriptTag({ content: EDITOR });
+  check("panel docks full-width to the bottom on a phone viewport", await phone.evaluate(() => {
+    const el = document.getElementById("wwwpdf-panel");
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return cs.position === "fixed" &&
+      Math.round(r.left) === 0 &&
+      Math.round(r.right) === window.innerWidth &&
+      Math.round(r.bottom) === window.innerHeight;
+  }));
+  // Enter Format: the preview must occupy the space above the sheet, not be
+  // eclipsed by it.
+  await phone.evaluate(() =>
+    [...document.querySelectorAll("#wwwpdf-panel a")].find((a) => a.textContent === "Format").click()
+  );
+  check("preview overlay stays visible above the docked sheet", await phone.evaluate(() => {
+    const panel = document.getElementById("wwwpdf-panel").getBoundingClientRect();
+    const ov = document.getElementById("wwwpdf-preview");
+    // Sheet leaves a meaningful strip of the viewport for the preview.
+    return !!ov && panel.top > window.innerHeight * 0.3;
+  }));
+  await phone.close();
+}
+
+// 18. On a wide (desktop/tablet) viewport the panel stays a floating card, not
+// docked — the bottom-sheet rules are phone-only.
+{
+  const wide = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+  await wide.setContent(SAMPLE, { waitUntil: "load" });
+  await wide.evaluate(() => { window.__TAURI_INTERNALS__ = {}; window.__WWWPDF_PRESETS = []; });
+  await wide.addScriptTag({ content: EDITOR });
+  check("panel is a floating top-right card on a wide viewport", await wide.evaluate(() => {
+    const r = document.getElementById("wwwpdf-panel").getBoundingClientRect();
+    return Math.round(r.left) > 0 && Math.round(r.right) < window.innerWidth &&
+      Math.round(r.top) < 100 && Math.round(r.width) < 400;
+  }));
+  await wide.close();
+}
+
 await browser.close();
 
 let ok = true;

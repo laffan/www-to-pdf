@@ -130,6 +130,22 @@
       "  html::after{display:none!important}",
       "  #" + NS + "-meta{display:" + (state.meta.show ? "block" : "none") + "!important}",
       "}",
+      // Phone form factor (portrait). The floating card would cover the whole
+      // screen — dock the toolbar as a full-width bottom sheet so the preview
+      // stays visible above it, and give the preview room to scroll clear of
+      // the sheet. !important beats the panel's inline positioning; safe-area
+      // insets keep the primary action above the home indicator / notch.
+      "@media (max-width:480px){",
+      "  #" + NS + "-panel{position:fixed!important;left:0!important;right:0!important;" +
+        "top:auto!important;bottom:0!important;width:auto!important;max-width:none!important;" +
+        "max-height:56vh!important;border-radius:16px 16px 0 0!important;" +
+        "border-left:0!important;border-right:0!important;border-bottom:0!important;" +
+        "padding-bottom:calc(12px + env(safe-area-inset-bottom,0px))!important;" +
+        "box-shadow:0 -10px 34px rgba(0,0,0,.24)!important}",
+      "  #" + NS + "-preview{padding-top:calc(20px + env(safe-area-inset-top,0px))!important;" +
+        "padding-bottom:60vh!important}",
+      "  #" + NS + "-toast{bottom:calc(60vh + env(safe-area-inset-bottom,0px))!important}",
+      "}",
       // Metadata header. Everything is !important so host-site CSS (resets,
       // `body > div` rules, etc.) can't hide or restyle it — the cause of the
       // "shows in export but not on screen" bug. No horizontal padding: the
@@ -1071,6 +1087,17 @@
     };
   }
 
+  // On iOS the safe-area insets (home indicator / notch) only resolve if the
+  // page opts into them via viewport-fit=cover. Most responsive sites already
+  // ship a viewport meta — append to it. Never create one where none exists,
+  // which could reflow a desktop-only site. No-op off the native app.
+  function ensureSafeAreaViewport() {
+    if (!window.__TAURI_INTERNALS__) return;
+    var mv = document.querySelector('meta[name="viewport"]');
+    if (!mv || /viewport-fit\s*=/.test(mv.content)) return;
+    mv.content = mv.content.trim() + (mv.content.trim() ? ", " : "") + "viewport-fit=cover";
+  }
+
   // ---- mount / unmount -----------------------------------------------------
   function mount(options) {
     options = options || {};
@@ -1080,6 +1107,7 @@
       });
     }
     ensureStyle();
+    ensureSafeAreaViewport();
     renderMeta();
     if (!document.getElementById(NS + "-panel")) {
       document.body.appendChild(buildPanel());
