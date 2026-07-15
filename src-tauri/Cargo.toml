@@ -25,13 +25,11 @@ tauri-plugin-dialog = "2"
 # Header/footer/page-number stamping onto rendered PDFs (pure Rust).
 lopdf = "0.43"
 
-# Apple message sends via raw objc2: macOS uses it for the createPDF render
-# pipeline; iOS uses it for the share-sheet (UIActivityViewController) export.
+# Apple message sends + completion-handler blocks: the createPDF render
+# pipeline (frame control, evaluateJavaScript, createPDF) is shared by macOS
+# and iOS; iOS additionally uses objc2 for the share sheet.
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc2 = "0.6"
-
-# block2 completion handlers are only used by the macOS render path so far.
-[target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 
 [features]

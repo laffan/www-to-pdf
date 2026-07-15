@@ -613,7 +613,7 @@ fn sanitize(s: &str) -> String {
 
 // Core Graphics geometry, hand-encoded to avoid the objc2-foundation
 // feature-flag chain.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod geom {
     use objc2::encode::{Encode, Encoding};
     #[repr(C)]
@@ -711,7 +711,7 @@ const CAPTURE_DONE_JS: &str =
 /// Set the WKWebView frame size (width and/or height); returns the previous
 /// size. wry attaches the webview with an autoresizing mask, not Auto Layout
 /// constraints, so a direct setFrameSize sticks until the window resizes.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 async fn set_webview_frame(
     webview: &tauri::WebviewWindow,
     w: Option<f64>,
@@ -732,11 +732,16 @@ async fn set_webview_frame(
                 return;
             }
             let fr: CGRect = msg_send![wk, frame];
-            let new = CGSize {
-                width: w.unwrap_or(fr.size.width),
-                height: h.unwrap_or(fr.size.height),
+            // setFrame: (CGRect) works on both NSView (macOS) and UIView (iOS);
+            // setFrameSize: is NSView-only. Keep the origin, change the size.
+            let new = CGRect {
+                origin: fr.origin,
+                size: CGSize {
+                    width: w.unwrap_or(fr.size.width),
+                    height: h.unwrap_or(fr.size.height),
+                },
             };
-            let _: () = msg_send![wk, setFrameSize: new];
+            let _: () = msg_send![wk, setFrame: new];
             let _ = tx.send(Ok((fr.size.width, fr.size.height)));
         })
         .map_err(|e| e.to_string())?;
@@ -748,7 +753,7 @@ async fn set_webview_frame(
 
 /// Evaluate JS in the target webview and return its string result. Runs via
 /// the native evaluateJavaScript (works on any origin, bypasses page CSP).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 async fn eval_js_string(webview: &tauri::WebviewWindow, script: &str) -> Result<String, String> {
     use block2::RcBlock;
     use objc2::msg_send;
@@ -805,7 +810,7 @@ async fn eval_js_string(webview: &tauri::WebviewWindow, script: &str) -> Result<
 /// Render the webview's full content to PDF bytes via WKWebView.createPDF
 /// (nil configuration = the whole view; the frame is pre-sized to the full
 /// content height so the whole document is captured).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 async fn wk_create_pdf(webview: &tauri::WebviewWindow) -> Result<Vec<u8>, String> {
     use block2::RcBlock;
     use objc2::msg_send;
@@ -858,7 +863,7 @@ async fn wk_create_pdf(webview: &tauri::WebviewWindow) -> Result<Vec<u8>, String
         .map_err(|_| "createPDF completion dropped".to_string())?
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 async fn render_pdf(
     webview: &tauri::WebviewWindow,
     p: &Margins,
@@ -1045,10 +1050,9 @@ fn paginate_tall_pdf(
     Ok(())
 }
 
-// iOS: createPDF/evaluateJavaScript exist there too, so the macOS pipeline
-// above ports directly (UIView frame + UIScrollView contentSize instead of
-// NSView frame). Not wired up yet; the app runs but export targets macOS.
-#[cfg(not(target_os = "macos"))]
+// Non-Apple desktop (Linux/Windows) and Android have no createPDF; PDF export
+// there is unimplemented. The app still builds and runs.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 async fn render_pdf(
     _webview: &tauri::WebviewWindow,
     _p: &Margins,
