@@ -34,9 +34,8 @@
     // US Letter output; margins in inches.
     margins: { top: 1, right: 1, bottom: 1, left: 1 },
     marginGuide: false,
-    // When true (native Format pane), the live page is styled to resemble the
-    // paginated US-Letter PDF: a centered white sheet on a gray backdrop with
-    // the margins rendered as padding.
+    // True while the native Format pane is showing the inline PDF preview
+    // overlay (the real rendered PDF, drawn by pdf.js).
     previewMode: false,
     // Header/footer are stamped onto the rendered PDF by the native side.
     header: "",
@@ -111,24 +110,11 @@
     var pageRule =
       "@page{size:8.5in 11in;margin:" +
       m.top + "in " + m.right + "in " + m.bottom + "in " + m.left + "in;}";
-    // On-screen guide: an inset outline showing the printable area. Suppressed
-    // in preview mode, where the margins are already drawn as the sheet padding.
-    var guideRule = state.marginGuide && !state.previewMode
+    // On-screen guide: an inset outline showing the printable area.
+    var guideRule = state.marginGuide
       ? "html{position:relative}html::after{content:'';position:fixed;pointer-events:none;z-index:2147483646;" +
         "top:" + m.top + "in;right:" + m.right + "in;bottom:" + m.bottom + "in;left:" + m.left + "in;" +
         "outline:1px dashed #2563eb;outline-offset:0}"
-      : "";
-    // Preview mode (native Format pane): reflow the live page to look like the
-    // paginated PDF — a centered white US-Letter sheet on a gray backdrop, the
-    // per-side margins rendered as the sheet's padding so content wraps at the
-    // true printable width. Best-effort against host CSS (hence !important);
-    // inline styles with their own !important can still win, but that's rare.
-    var previewRule = state.previewMode
-      ? "html{background:#52525b!important;padding:24px 0!important;box-sizing:border-box!important;}" +
-        "body{width:8.5in!important;max-width:8.5in!important;min-height:11in!important;" +
-        "margin:0 auto!important;background:#fff!important;color:#111!important;" +
-        "box-shadow:0 2px 24px rgba(0,0,0,.4)!important;box-sizing:border-box!important;" +
-        "padding:" + m.top + "in " + m.right + "in " + m.bottom + "in " + m.left + "in!important;}"
       : "";
     s.textContent = [
       pageRule,
@@ -137,7 +123,6 @@
       bodyRule,
       hs !== 1 ? headRule : "",
       guideRule,
-      previewRule,
       // The tool's own chrome must never appear in the exported PDF.
       "@media print{",
       "  #" + NS + "-panel,#" + NS + "-panel *,#" + NS + "-toast{display:none!important}",
@@ -639,9 +624,11 @@
       if (editing) setRemoveMode(false);
       cEdit.style.cssText = "font-size:12px;text-decoration:none;cursor:pointer;" + (editing ? CRUMB_ON : CRUMB_OFF);
       cFormat.style.cssText = "font-size:12px;text-decoration:none;cursor:pointer;" + (editing ? CRUMB_OFF : CRUMB_ON);
-      // The Format stage previews the page as printed sheets.
+      // The Format stage shows the real rendered PDF inline; Edit hides it so
+      // the live page is interactive again for logging in / removing clutter.
       state.previewMode = !editing;
-      render_style();
+      if (editing) closePreview();
+      else openPreview();
       panel.scrollTop = 0;
     }
 
@@ -649,8 +636,8 @@
       style: STYLE_PRIMARY, onclick: function () { showPane("format"); },
     }, ["Next: Format →"]);
     var previewBtn = el("button", {
-      style: STYLE_BTN + ";text-align:center", onclick: function () { nativeExport("preview"); },
-    }, ["Preview PDF"]);
+      style: STYLE_BTN + ";text-align:center", onclick: function () { requestPreview(); },
+    }, ["↻ Refresh preview"]);
     var saveNativeBtn = el("button", {
       style: STYLE_PRIMARY, onclick: function () { nativeExport("save"); },
     }, ["Save PDF"]);
@@ -883,7 +870,8 @@
       "&header=" + encodeURIComponent(state.header || "") +
       "&footer=" + encodeURIComponent(state.footer || "") +
       "&pagenum=" + (state.pageNumbers ? "1" : "0");
-    toast(action === "preview" ? "Rendering preview…" : "Rendering PDF…");
+    // Preview shows its status in the overlay; only save needs a toast.
+    if (action !== "preview") toast("Rendering PDF…");
     setTimeout(function () {
       window.location.href = "https://" + EXPORT_HOST + "/?" + q;
     }, 30);
@@ -893,7 +881,152 @@
   }
   // Called by Rust (via eval) after a render completes.
   function afterExport(ok, message) {
+    // A failed preview render surfaces in the overlay it was rendering into,
+    // not the toast (the overlay is already the user's focus).
+    var wasPreview = _pvPending;
+    _pvPending = false;
+    if (!ok && wasPreview && previewOverlay()) {
+      previewStatus("Preview failed: " + message);
+      return;
+    }
     toast((ok ? "" : "PDF failed: ") + message);
+  }
+
+  // ---- inline PDF preview (native Format stage) ----------------------------
+  // The real rendered PDF is streamed here from Rust as base64 (chunked so each
+  // eval stays small) and drawn to <canvas> with pdf.js — no <embed>/<iframe>
+  // and no Web Worker, so even a strict site CSP can't block it. Rust injects
+  // pdf.min.js + pdf.worker.min.js before the first chunk arrives.
+  var _pvBuf = "";
+  var _pvPending = false;
+
+  function previewOverlay() {
+    return document.getElementById(NS + "-preview");
+  }
+  function previewStatus(msg) {
+    var ov = previewOverlay();
+    if (!ov) return;
+    var pages = document.getElementById(NS + "-preview-pages");
+    if (pages) pages.textContent = "";
+    var s = el(
+      "div",
+      {
+        style:
+          "margin:auto;padding:48px 24px;text-align:center;" +
+          "color:#e4e4e7;font:14px system-ui,-apple-system,sans-serif",
+      },
+      [msg]
+    );
+    (pages || ov).appendChild(s);
+  }
+  // Open the overlay and kick off a render. Called when the Format stage opens.
+  function openPreview() {
+    var ov = previewOverlay();
+    if (!ov) {
+      ov = el("div", {
+        id: NS + "-preview",
+        style:
+          "position:fixed;inset:0;z-index:2147483640;background:#3f3f46;" +
+          "overflow:auto;-webkit-overflow-scrolling:touch;padding:28px 0",
+      });
+      ov.appendChild(
+        el("div", {
+          id: NS + "-preview-pages",
+          style:
+            "display:flex;flex-direction:column;align-items:center;gap:20px;" +
+            "min-height:100%;box-sizing:border-box",
+        })
+      );
+      document.body.appendChild(ov);
+    }
+    requestPreview();
+  }
+  function closePreview() {
+    var ov = previewOverlay();
+    if (ov) ov.remove();
+    _pvBuf = "";
+    _pvPending = false;
+  }
+  // Re-render the current settings into the (already open) overlay.
+  function requestPreview() {
+    if (!previewOverlay()) return;
+    previewStatus("Rendering PDF…");
+    _pvPending = true;
+    nativeExport("preview");
+  }
+
+  // Chunk protocol driven by Rust: __pvBegin, then N × __pvChunk, then __pvEnd.
+  function pvBegin() {
+    _pvBuf = "";
+    _pvPending = false; // bytes are on the way — the render itself succeeded
+    previewStatus("Rendering PDF…");
+  }
+  function pvChunk(s) {
+    _pvBuf += s;
+  }
+  function pvEnd() {
+    var b64 = _pvBuf;
+    _pvBuf = "";
+    var bytes;
+    try {
+      var bin = atob(b64);
+      bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch (e) {
+      previewStatus("Could not decode the preview.");
+      return;
+    }
+    renderPreviewDoc(bytes);
+  }
+  function renderPreviewDoc(bytes) {
+    var ov = previewOverlay();
+    if (!ov) return; // the user left the Format stage before bytes arrived
+    var lib = window.pdfjsLib;
+    if (!lib || !lib.getDocument) {
+      previewStatus("Preview engine unavailable.");
+      return;
+    }
+    var pages = document.getElementById(NS + "-preview-pages");
+    lib
+      .getDocument({ data: bytes })
+      .promise.then(function (doc) {
+        if (!previewOverlay()) return;
+        pages.textContent = "";
+        var dpr = window.devicePixelRatio || 1;
+        var avail = Math.max(200, ov.clientWidth - 56);
+        var maxW = Math.min(avail, 900);
+        // Render pages sequentially to keep peak memory down on long docs.
+        var chain = Promise.resolve();
+        var _loop = function (num) {
+          chain = chain.then(function () {
+            if (!previewOverlay()) return;
+            return doc.getPage(num).then(function (page) {
+              var vp1 = page.getViewport({ scale: 1 });
+              var scale = maxW / vp1.width;
+              var cssW = Math.round(vp1.width * scale);
+              var cssH = Math.round(vp1.height * scale);
+              var canvas = el("canvas", {
+                style:
+                  "background:#fff;box-shadow:0 2px 20px rgba(0,0,0,.45);" +
+                  "width:" + cssW + "px;height:" + cssH + "px;max-width:100%",
+              });
+              var vp = page.getViewport({ scale: scale * dpr });
+              canvas.width = Math.round(vp.width);
+              canvas.height = Math.round(vp.height);
+              pages.appendChild(canvas);
+              return page.render({
+                canvasContext: canvas.getContext("2d"),
+                viewport: vp,
+              }).promise;
+            });
+          });
+        };
+        for (var n = 1; n <= doc.numPages; n++) _loop(n);
+        return chain;
+      })
+      .catch(function (e) {
+        previewStatus("Preview failed: " + (e && e.message ? e.message : e));
+      });
   }
 
   function exportPdf() {
@@ -959,6 +1092,7 @@
   }
   function unmount() {
     setRemoveMode(false);
+    closePreview();
     document.removeEventListener("mouseover", onOver, true);
     document.removeEventListener("mouseout", onOut, true);
     document.removeEventListener("click", onClick, true);
@@ -973,6 +1107,10 @@
   window.wwwToPdf.state = state;
   window.wwwToPdf.toast = toast; // native side calls this for progress/errors
   window.wwwToPdf.afterExport = afterExport; // native side reports render result
+  // Inline-preview chunk protocol, driven from Rust after a preview render.
+  window.wwwToPdf.__pvBegin = pvBegin;
+  window.wwwToPdf.__pvChunk = pvChunk;
+  window.wwwToPdf.__pvEnd = pvEnd;
 
   // The single native webview also shows our own app UI (the URL-entry page),
   // which sets __WWWPDF_IS_APP. Don't mount the editor there.

@@ -318,30 +318,30 @@ check("Next reveals format pane; edit pane hidden", await page2.evaluate(() => {
     fmt.querySelectorAll("input[type=range]").length === 3 &&      // body/line/heading
     fmt.querySelectorAll("input[type=number]").length === 4;       // margins
 }));
-check("format pane switches on the previewMode PDF-sheet styling", await page2.evaluate(() => {
-  const css = document.getElementById("wwwpdf-style").textContent;
-  return window.wwwToPdf.state.previewMode === true &&
-    /body\{[^}]*width:8\.5in/.test(css) &&
-    getComputedStyle(document.body).backgroundColor === "rgb(255, 255, 255)";
-}));
+check("entering Format opens the inline preview overlay + sets previewMode", await page2.evaluate(() =>
+  window.wwwToPdf.state.previewMode === true &&
+  !!document.getElementById("wwwpdf-preview")
+));
 
 // 12b. Breadcrumb: Link · Edit · Format, each clickable to jump stages.
 check("breadcrumb has Link / Edit / Format crumbs", await page2.evaluate(() => {
   const labels = [...document.querySelectorAll("#wwwpdf-panel a")].map((a) => a.textContent);
   return ["Link", "Edit", "Format"].every((l) => labels.includes(l));
 }));
-check("clicking 'Edit' crumb returns to edit pane and clears preview", await page2.evaluate(() => {
+check("clicking 'Edit' crumb returns to edit pane and closes the preview overlay", await page2.evaluate(() => {
   [...document.querySelectorAll("#wwwpdf-panel a")].find((a) => a.textContent === "Edit").click();
   const edit = document.getElementById("wwwpdf-pane-edit");
   const fmt = document.getElementById("wwwpdf-pane-format");
   return getComputedStyle(edit).display !== "none" &&
     getComputedStyle(fmt).display === "none" &&
-    window.wwwToPdf.state.previewMode === false;
+    window.wwwToPdf.state.previewMode === false &&
+    !document.getElementById("wwwpdf-preview");
 }));
-check("clicking 'Format' crumb re-enters the format pane", await page2.evaluate(() => {
+check("clicking 'Format' crumb re-enters the format pane + reopens the overlay", await page2.evaluate(() => {
   [...document.querySelectorAll("#wwwpdf-panel a")].find((a) => a.textContent === "Format").click();
   return getComputedStyle(document.getElementById("wwwpdf-pane-format")).display !== "none" &&
-    window.wwwToPdf.state.previewMode === true;
+    window.wwwToPdf.state.previewMode === true &&
+    !!document.getElementById("wwwpdf-preview");
 }));
 check("format pane has header/footer + page-numbers", await page2.evaluate(() => {
   const fmt = document.getElementById("wwwpdf-pane-format");
@@ -376,10 +376,10 @@ check("Save fires export sentinel with action=save + params", (() => {
 await page2.evaluate(() => {
   exportNavUrl = null;
   [...document.querySelectorAll("#wwwpdf-panel button")]
-    .find((b) => b.textContent === "Preview PDF").click();
+    .find((b) => b.textContent.includes("Refresh preview")).click();
 });
 await page2.waitForTimeout(200);
-check("Preview fires export sentinel with action=preview", (() => {
+check("Refresh preview fires export sentinel with action=preview", (() => {
   if (!exportNavUrl) return false;
   return new URL(exportNavUrl).searchParams.get("action") === "preview";
 })());
@@ -404,6 +404,66 @@ check("editor suppressed on the app's own page", await appPage.evaluate(() =>
   !document.getElementById("wwwpdf-panel")
 ));
 await appPage.close();
+
+// 16. Inline PDF preview: the chunk protocol + pdf.js (the VENDORED build Rust
+// injects) render the real PDF to <canvas> — even under a strict site CSP that
+// forbids Web Workers (proving the main-thread fake-worker path). This is the
+// half Rust drives via eval; here we drive it directly to prove the JS side.
+{
+  const PDF_LIB = readFileSync(new URL("../src-tauri/assets/pdf.min.js", import.meta.url), "utf8");
+  const PDF_WORKER = readFileSync(new URL("../src-tauri/assets/pdf.worker.min.js", import.meta.url), "utf8");
+  // A minimal valid 2-page PDF (built offline; "Page One" / "Page Two").
+  const PDF_B64 =
+    "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUiA1IDAgUl0gL0NvdW50IDIgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA3IDAgUiA+PiA+PiAvQ29udGVudHMgNCAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCAzOSA+PgpzdHJlYW0KQlQgL0YxIDI0IFRmIDcyIDcwMCBUZCAoUGFnZSBPbmUpIFRqIEVUCmVuZHN0cmVhbQplbmRvYmoKNSAwIG9iago8PCAvVHlwZSAvUGFnZSAvUGFyZW50IDIgMCBSIC9NZWRpYUJveCBbMCAwIDYxMiA3OTJdIC9SZXNvdXJjZXMgPDwgL0ZvbnQgPDwgL0YxIDcgMCBSID4+ID4+IC9Db250ZW50cyA2IDAgUiA+PgplbmRvYmoKNiAwIG9iago8PCAvTGVuZ3RoIDM5ID4+CnN0cmVhbQpCVCAvRjEgMjQgVGYgNzIgNzAwIFRkIChQYWdlIFR3bykgVGogRVQKZW5kc3RyZWFtCmVuZG9iago3IDAgb2JqCjw8IC9UeXBlIC9Gb250IC9TdWJ0eXBlIC9UeXBlMSAvQmFzZUZvbnQgL0hlbHZldGljYSA+PgplbmRvYmoKeHJlZgowIDgKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTggMDAwMDAgbiAKMDAwMDAwMDEyMSAwMDAwMCBuIAowMDAwMDAwMjQ3IDAwMDAwIG4gCjAwMDAwMDAzMzYgMDAwMDAgbiAKMDAwMDAwMDQ2MiAwMDAwMCBuIAowMDAwMDAwNTUxIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgOCAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNjIxCiUlRU9G";
+
+  const pvPage = await browser.newPage();
+  // Serve a strict-CSP page (no workers, no blob scripts) to prove the
+  // fake-worker path renders without a Web Worker.
+  await pvPage.route("https://strict.example/", (route) => route.fulfill({
+    status: 200, contentType: "text/html",
+    headers: { "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:;" },
+    body: "<!doctype html><html><body><h1>strict page</h1></body></html>",
+  }));
+  await pvPage.route("https://wwwtopdf.export/**", (route) => route.abort("aborted"));
+  await pvPage.goto("https://strict.example/", { waitUntil: "load" });
+  await pvPage.evaluate(() => { window.__TAURI_INTERNALS__ = {}; window.__WWWPDF_PRESETS = []; });
+  await pvPage.addScriptTag({ content: EDITOR });
+  // Enter Format -> opens the overlay (and fires a preview nav we abort).
+  await pvPage.evaluate(() =>
+    [...document.querySelectorAll("#wwwpdf-panel a")].find((a) => a.textContent === "Format").click()
+  );
+  check("overlay present after entering Format", await pvPage.evaluate(() =>
+    !!document.getElementById("wwwpdf-preview")
+  ));
+  // Rust would inject these two scripts before streaming; do the same.
+  await pvPage.addScriptTag({ content: PDF_LIB });
+  await pvPage.addScriptTag({ content: PDF_WORKER });
+  check("pdf.js UMD + worker load as classic scripts", await pvPage.evaluate(() =>
+    typeof window.pdfjsLib === "object" && typeof window.pdfjsWorker === "object"
+  ));
+  // Drive the chunk protocol exactly as Rust does.
+  await pvPage.evaluate((b64) => {
+    window.wwwToPdf.__pvBegin();
+    for (let i = 0; i < b64.length; i += 200) window.wwwToPdf.__pvChunk(b64.slice(i, i + 200));
+    window.wwwToPdf.__pvEnd();
+  }, PDF_B64);
+  await pvPage.waitForFunction(
+    () => document.querySelectorAll("#wwwpdf-preview canvas").length >= 2,
+    { timeout: 8000 }
+  ).catch(() => {});
+  check("inline preview renders both PDF pages to canvas (no worker, strict CSP)",
+    await pvPage.evaluate(() => document.querySelectorAll("#wwwpdf-preview canvas").length === 2)
+  );
+  check("rendered canvas actually has drawn content", await pvPage.evaluate(() => {
+    const c = document.querySelector("#wwwpdf-preview canvas");
+    if (!c) return false;
+    const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+    let nonWhite = 0;
+    for (let i = 0; i < d.length; i += 4) if (d[i] < 250 || d[i + 1] < 250 || d[i + 2] < 250) nonWhite++;
+    return nonWhite > 20;
+  }));
+  await pvPage.close();
+}
 
 await browser.close();
 

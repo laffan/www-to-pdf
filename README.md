@@ -16,13 +16,11 @@ lets you jump straight back to any of them:
 3. **Format** — "Next" flips the toolbar to formatting: body size, line height,
    heading scale, per-side margins (US Letter), a sans-serif metadata header
    (title, URL, author, access date, notes), and header/footer with optional
-   page numbers — all applied live. Entering Format also reflows the live page
-   into a **PDF-sheet preview**: a centered white US-Letter sheet on a gray
-   backdrop, margins drawn as padding, so you see the printable layout as you
-   adjust it.
-4. **Preview / Save** — Preview renders the real PDF and opens it in the OS
-   viewer (share sheet on iOS); Save writes it (save dialog on desktop, share
-   sheet on iOS).
+   page numbers. Entering Format renders the **real PDF and shows it inline**
+   (drawn by pdf.js on a gray backdrop) — the actual paginated output, not an
+   HTML approximation. "Refresh preview" re-renders after you adjust settings.
+4. **Save** — writes the previewed PDF (save dialog on desktop, share sheet on
+   iOS).
 
 It ships as a **web app** (GitHub Pages) and a **native app** (Tauri 2, desktop + iOS).
 
@@ -72,11 +70,16 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   (back to URL entry), `wwwtopdf.preset?action=…` (persist). Fonts/metadata are
   applied directly to the page DOM (so `createPDF` captures them); only margins,
   header/footer, page-numbers and the filename ride the export sentinel.
-- **Preview vs. save.** A strict site CSP can block an embedded PDF, so there's
-  no in-page preview pane; instead "Preview" renders the real PDF and opens it
-  in the OS viewer (Quick Look on macOS, share sheet on iOS), and "Save" writes
-  it (save dialog on desktop, share sheet on iOS). Rendering on demand also
-  avoids re-rendering on every keystroke.
+- **Inline preview with pdf.js.** Entering Format renders the real PDF and
+  shows it *inside the page*: Rust injects a vendored pdf.js (UMD build +
+  worker) into the target webview and streams the rendered PDF bytes over as
+  chunked base64 (via `eval` + the editor's `__pv*` chunk protocol); the editor
+  draws each page to a `<canvas>` in a full-screen overlay. Drawing to canvas
+  (not `<embed>`/`<iframe>`) with the worker running on the **main thread** (a
+  fake worker) means even a strict site CSP — `object-src 'none'`,
+  `worker-src 'none'` — can't block the preview. Rendering on demand ("Refresh
+  preview") avoids re-rendering on every keystroke. "Save" writes the same file
+  (save dialog on desktop, share sheet on iOS).
 - **Rendering = createPDF + Rust pagination** (shared by macOS and iOS). WKWebView's
   `printOperationWithPrintInfo:` derives its layout width and scale from the
   *printer's* imageable bounds (constant for save-to-PDF) while clipping to
@@ -200,6 +203,7 @@ src/main.js           web controller: iframe load, cross-origin fallback, Tauri 
 src/ui.css            app chrome
 public/editor.js      the shared editing engine (iframe inject / native)
 src-tauri/            Tauri 2 native app
+src-tauri/assets/     vendored pdf.js (UMD build + worker) for the inline preview
 .github/workflows/    Pages deploy
 ```
 

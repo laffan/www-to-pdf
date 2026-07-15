@@ -21,6 +21,17 @@ use tauri::{Manager, Url, WebviewUrl, WebviewWindowBuilder};
 // The shared editor engine, embedded so the native build is self-contained.
 const EDITOR_JS: &str = include_str!("../../public/editor.js");
 
+// pdf.js (UMD build + its worker), vendored from pdfjs-dist. Injected into the
+// target webview on demand to render the inline PDF preview. Embedded only on
+// the Apple targets that have a native PDF renderer to preview. Kept as classic
+// scripts (window.pdfjsLib / window.pdfjsWorker) so they run on any page; the
+// worker is used as a main-thread fake worker, so a strict site CSP that
+// forbids Web Workers can't block preview rendering.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const PDF_JS_LIB: &str = include_str!("../assets/pdf.min.js");
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const PDF_JS_WORKER: &str = include_str!("../assets/pdf.worker.min.js");
+
 // Sentinel hosts the editor navigates to; see editor.js.
 const EXPORT_HOST: &str = "wwwtopdf.export"; // ?action=save|preview&margins…
 const HOME_HOST: &str = "wwwtopdf.home"; // back to URL entry
@@ -248,16 +259,39 @@ async fn do_export(app: tauri::AppHandle, url: Url) {
         return;
     }
 
-    let outcome = if action == "preview" {
-        present_preview(&app, &out_str).await
-    } else {
-        present_save(&app, &out_str, &title).await
-    };
-    match outcome {
+    if action == "preview" {
+        // Stream the rendered PDF into the in-page pdf.js overlay. On success
+        // the overlay is the feedback, so there's no toast; only errors report.
+        if let Err(e) = present_inline_preview(&app, &out_str).await {
+            report(&app, false, &e);
+        }
+        return;
+    }
+
+    match present_save(&app, &out_str, &title).await {
         Ok(Some(path)) => report(&app, true, &format!("Saved → {path}")),
         Ok(None) => report(&app, true, "Done"),
         Err(e) => report(&app, false, &e),
     }
+}
+
+/// Base64-encode (standard alphabet, padded) for handing PDF bytes to the
+/// webview's `atob`. Hand-rolled to avoid a new dependency.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 // ---- header/footer stamping (pure Rust, all platforms) ---------------------
@@ -482,33 +516,59 @@ async fn present_save(
     }
 }
 
-/// Preview: open in the OS viewer on desktop, share sheet on iOS.
-async fn present_preview(app: &tauri::AppHandle, src: &str) -> Result<Option<String>, String> {
+/// Preview: stream the rendered PDF into the in-page pdf.js overlay. pdf.js is
+/// injected into the target webview on first use (the fake worker keeps it
+/// CSP-safe), then the PDF bytes are sent over as chunked base64 via the
+/// editor's `__pv*` chunk protocol. Works the same on macOS and iOS — the
+/// preview is drawn to <canvas> inside the page, no OS viewer / share sheet.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+async fn present_inline_preview(app: &tauri::AppHandle, src: &str) -> Result<(), String> {
     if !std::path::Path::new(src).exists() {
         return Err("No rendered PDF to preview.".into());
     }
-    // Each arm uses an explicit `return` so that after cfg-stripping the kept
-    // block diverges regardless of whether it lands in statement or tail
-    // position (avoids the "middle cfg block parsed as a statement" gotcha).
-    #[cfg(target_os = "ios")]
-    {
-        ios_share(app, src)?;
-        return Ok(None);
+    let webview = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window missing".to_string())?;
+    let bytes = std::fs::read(src).map_err(|e| format!("read preview: {e}"))?;
+    let b64 = base64_encode(&bytes);
+
+    // Inject pdf.js once per loaded page. evaluateJavaScript runs on any origin
+    // (bypasses page CSP), and the vendored worker registers window.pdfjsWorker
+    // for a main-thread fake worker, so no worker-src is needed.
+    let present = eval_js_string(&webview, "(typeof window.pdfjsLib)")
+        .await
+        .unwrap_or_default();
+    if present.trim() != "object" {
+        webview.eval(PDF_JS_LIB).map_err(|e| e.to_string())?;
+        webview.eval(PDF_JS_WORKER).map_err(|e| e.to_string())?;
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = app;
-        std::process::Command::new("open")
-            .arg(src)
-            .spawn()
-            .map_err(|e| format!("Could not open PDF: {e}"))?;
-        return Ok(None);
+
+    // Hand the bytes to the overlay in base64 chunks so no single
+    // evaluateJavaScript payload is enormous. Evals run in submission order.
+    webview
+        .eval("window.wwwToPdf&&window.wwwToPdf.__pvBegin&&window.wwwToPdf.__pvBegin()")
+        .map_err(|e| e.to_string())?;
+    const CHUNK: usize = 512 * 1024;
+    let mut i = 0;
+    while i < b64.len() {
+        let end = (i + CHUNK).min(b64.len());
+        let piece = &b64[i..end]; // base64 is ASCII, so byte slicing is safe
+        let js = format!(
+            "window.wwwToPdf.__pvChunk({})",
+            serde_json::to_string(piece).unwrap_or_else(|_| "\"\"".into())
+        );
+        webview.eval(&js).map_err(|e| e.to_string())?;
+        i = end;
     }
-    #[cfg(not(any(target_os = "ios", target_os = "macos")))]
-    {
-        let _ = (app, src);
-        return Err("Preview is only implemented on macOS and iOS.".into());
-    }
+    webview
+        .eval("window.wwwToPdf.__pvEnd()")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+async fn present_inline_preview(_app: &tauri::AppHandle, _src: &str) -> Result<(), String> {
+    Err("Preview is only implemented on macOS and iOS.".into())
 }
 
 /// iOS share sheet (UIActivityViewController) anchored on the webview.
