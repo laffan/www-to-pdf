@@ -16,6 +16,11 @@
     <script>window.__WWWPDF_IS_APP = true;</script>
   </head>
   <body>
+    <!-- Indeterminate progress bar shown while a page is loading. A cross-origin
+         navigation gives no real progress, so this is a moving indicator that
+         reassures the user the app hasn't frozen on a slow connection. -->
+    <div id="load-bar" class="load-bar" hidden><div class="load-bar-fill"></div></div>
+
     <!-- ============ SCREEN 1: URL ENTRY ============ -->
     <main id="entry" class="entry">
       <form id="url-form" class="url-form" autocomplete="off">
@@ -29,6 +34,7 @@
         <button type="submit">Load</button>
       </form>
       <p class="entry-note" id="entry-error" hidden></p>
+      <p class="entry-status" id="entry-status" hidden></p>
       <ul id="history" class="history"></ul>
     </main>
 

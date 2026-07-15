@@ -68,6 +68,49 @@ body {
   cursor: pointer;
 }
 .entry-note { color: #dc2626; font-size: 13px; margin: 0; }
+.entry-status {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.entry-status::before {
+  content: "";
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--line);
+  border-top-color: var(--ink);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+/* ---------- loading progress bar ---------- */
+.load-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 9999;
+  overflow: hidden;
+  background: transparent;
+}
+.load-bar-fill {
+  height: 100%;
+  width: 35%;
+  background: var(--ink);
+  border-radius: 0 3px 3px 0;
+  animation: load-slide 1.15s ease-in-out infinite;
+}
+@keyframes load-slide {
+  0% { margin-left: -35%; }
+  100% { margin-left: 100%; }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
 .history {
   list-style: none;
   margin: 4px 0 0;

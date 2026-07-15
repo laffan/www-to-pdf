@@ -129,17 +129,38 @@ function showEntryError(msg) {
   e.hidden = false;
 }
 
+// ---- loading indicator ------------------------------------------------------
+function showLoading(url) {
+  const bar = $("load-bar");
+  if (bar) bar.hidden = false;
+  const st = $("entry-status");
+  if (st) {
+    let host = url;
+    try { host = new URL(url).host; } catch {}
+    st.textContent = "Loading " + host + "…";
+    st.hidden = false;
+  }
+}
+function hideLoading() {
+  const bar = $("load-bar");
+  if (bar) bar.hidden = true;
+  const st = $("entry-status");
+  if (st) st.hidden = true;
+}
+
 // ---- load a URL into the viewer ------------------------------------------
 let loadTimer = null;
 function load(url) {
   $("entry-error").hidden = true;
   pushHistory(url);
+  showLoading(url);
 
   // Native app: navigate this single webview to the page in place. Use a
   // plain top-level navigation — the same mechanism the editor's sentinels
   // use, so it's known to work here — rather than a Rust command. The editor
   // init-script takes over on the loaded page. Rust captures the app page as
-  // "home" (see on_page_load) so "New URL" can return.
+  // "home" (see on_page_load) so "New URL" can return. The bar stays up until
+  // the webview swaps in the freshly loaded document (this page unloads).
   if (isTauri) {
     window.location.assign(url);
     return;
@@ -163,6 +184,7 @@ function load(url) {
 
 function onFrameLoad() {
   clearTimeout(loadTimer);
+  hideLoading();
   // Try to reach into the frame. Cross-origin access throws — that's our
   // signal that in-frame editing is impossible and we should point the user
   // to the native app.
@@ -210,12 +232,14 @@ function injectEditor(doc) {
 
 function showBlocked(reason) {
   clearTimeout(loadTimer);
+  hideLoading();
   $("blocked-reason").textContent = reason;
   blocked.hidden = false;
 }
 
 // ---- viewer controls ------------------------------------------------------
 $("back-btn").addEventListener("click", () => {
+  hideLoading();
   viewer.hidden = true;
   entry.hidden = false;
   frame.src = "about:blank";

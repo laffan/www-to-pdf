@@ -318,6 +318,31 @@ check("Next reveals format pane; edit pane hidden", await page2.evaluate(() => {
     fmt.querySelectorAll("input[type=range]").length === 3 &&      // body/line/heading
     fmt.querySelectorAll("input[type=number]").length === 4;       // margins
 }));
+check("format pane switches on the previewMode PDF-sheet styling", await page2.evaluate(() => {
+  const css = document.getElementById("wwwpdf-style").textContent;
+  return window.wwwToPdf.state.previewMode === true &&
+    /body\{[^}]*width:8\.5in/.test(css) &&
+    getComputedStyle(document.body).backgroundColor === "rgb(255, 255, 255)";
+}));
+
+// 12b. Breadcrumb: Link · Edit · Format, each clickable to jump stages.
+check("breadcrumb has Link / Edit / Format crumbs", await page2.evaluate(() => {
+  const labels = [...document.querySelectorAll("#wwwpdf-panel a")].map((a) => a.textContent);
+  return ["Link", "Edit", "Format"].every((l) => labels.includes(l));
+}));
+check("clicking 'Edit' crumb returns to edit pane and clears preview", await page2.evaluate(() => {
+  [...document.querySelectorAll("#wwwpdf-panel a")].find((a) => a.textContent === "Edit").click();
+  const edit = document.getElementById("wwwpdf-pane-edit");
+  const fmt = document.getElementById("wwwpdf-pane-format");
+  return getComputedStyle(edit).display !== "none" &&
+    getComputedStyle(fmt).display === "none" &&
+    window.wwwToPdf.state.previewMode === false;
+}));
+check("clicking 'Format' crumb re-enters the format pane", await page2.evaluate(() => {
+  [...document.querySelectorAll("#wwwpdf-panel a")].find((a) => a.textContent === "Format").click();
+  return getComputedStyle(document.getElementById("wwwpdf-pane-format")).display !== "none" &&
+    window.wwwToPdf.state.previewMode === true;
+}));
 check("format pane has header/footer + page-numbers", await page2.evaluate(() => {
   const fmt = document.getElementById("wwwpdf-pane-format");
   const texts = [...fmt.querySelectorAll("input[type=text]")];
@@ -359,13 +384,13 @@ check("Preview fires export sentinel with action=preview", (() => {
   return new URL(exportNavUrl).searchParams.get("action") === "preview";
 })());
 
-// 14. New URL fires the home sentinel.
+// 14. The "Link" breadcrumb fires the home sentinel (back to URL entry).
 await page2.evaluate(() => {
   [...document.querySelectorAll("#wwwpdf-panel a")]
-    .find((a) => a.textContent === "New URL").click();
+    .find((a) => a.textContent === "Link").click();
 });
 await page2.waitForTimeout(200);
-check("New URL fires home sentinel", homeNav);
+check("'Link' breadcrumb fires home sentinel", homeNav);
 
 // 15. The editor does not mount on our own app page (__WWWPDF_IS_APP).
 const appPage = await browser.newPage();

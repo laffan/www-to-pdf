@@ -34,6 +34,10 @@
     // US Letter output; margins in inches.
     margins: { top: 1, right: 1, bottom: 1, left: 1 },
     marginGuide: false,
+    // When true (native Format pane), the live page is styled to resemble the
+    // paginated US-Letter PDF: a centered white sheet on a gray backdrop with
+    // the margins rendered as padding.
+    previewMode: false,
     // Header/footer are stamped onto the rendered PDF by the native side.
     header: "",
     footer: "",
@@ -107,11 +111,24 @@
     var pageRule =
       "@page{size:8.5in 11in;margin:" +
       m.top + "in " + m.right + "in " + m.bottom + "in " + m.left + "in;}";
-    // On-screen guide: an inset outline showing the printable area.
-    var guideRule = state.marginGuide
+    // On-screen guide: an inset outline showing the printable area. Suppressed
+    // in preview mode, where the margins are already drawn as the sheet padding.
+    var guideRule = state.marginGuide && !state.previewMode
       ? "html{position:relative}html::after{content:'';position:fixed;pointer-events:none;z-index:2147483646;" +
         "top:" + m.top + "in;right:" + m.right + "in;bottom:" + m.bottom + "in;left:" + m.left + "in;" +
         "outline:1px dashed #2563eb;outline-offset:0}"
+      : "";
+    // Preview mode (native Format pane): reflow the live page to look like the
+    // paginated PDF — a centered white US-Letter sheet on a gray backdrop, the
+    // per-side margins rendered as the sheet's padding so content wraps at the
+    // true printable width. Best-effort against host CSS (hence !important);
+    // inline styles with their own !important can still win, but that's rare.
+    var previewRule = state.previewMode
+      ? "html{background:#52525b!important;padding:24px 0!important;box-sizing:border-box!important;}" +
+        "body{width:8.5in!important;max-width:8.5in!important;min-height:11in!important;" +
+        "margin:0 auto!important;background:#fff!important;color:#111!important;" +
+        "box-shadow:0 2px 24px rgba(0,0,0,.4)!important;box-sizing:border-box!important;" +
+        "padding:" + m.top + "in " + m.right + "in " + m.bottom + "in " + m.left + "in!important;}"
       : "";
     s.textContent = [
       pageRule,
@@ -120,6 +137,7 @@
       bodyRule,
       hs !== 1 ? headRule : "",
       guideRule,
+      previewRule,
       // The tool's own chrome must never appear in the exported PDF.
       "@media print{",
       "  #" + NS + "-panel,#" + NS + "-panel *,#" + NS + "-toast{display:none!important}",
@@ -205,10 +223,13 @@
   }
   function setRemoveMode(on) {
     state.removeMode = on;
-    document.getElementById(NS + "-removebtn").setAttribute("aria-pressed", on);
-    document.getElementById(NS + "-removebtn").textContent = on
-      ? "● Click elements to remove"
-      : "Remove elements";
+    // The button may not be in the document yet (initial showPane runs while
+    // the panel is still being built); default text/aria already match `off`.
+    var btn = document.getElementById(NS + "-removebtn");
+    if (btn) {
+      btn.setAttribute("aria-pressed", on);
+      btn.textContent = on ? "● Click elements to remove" : "Remove elements";
+    }
     if (!on) onOut();
   }
   function undo() {
@@ -335,7 +356,9 @@
       return el("div", { style: "height:1px;background:#ececf0;margin:10px 0" });
     }
 
-    // drag handle / title bar
+    // drag handle / title bar. The title slot is filled below: a stage
+    // breadcrumb in the native app, a plain label on the web.
+    var titleSlot = el("div", { style: "display:flex;align-items:center;gap:6px" });
     var bar = el(
       "div",
       {
@@ -344,7 +367,7 @@
           "cursor:move;margin:-4px -4px 8px;padding:4px 4px 8px;border-bottom:1px solid #ececf0;user-select:none",
       },
       [
-        el("strong", { style: "font-size:13px" }, ["Prepare source"]),
+        titleSlot,
         el(
           "button",
           {
@@ -546,6 +569,7 @@
 
     // ============================ WEB (flat, print) ============================
     if (!isNative) {
+      titleSlot.appendChild(el("strong", { style: "font-size:13px" }, ["Prepare source"]));
       var saveBtn = el("button", { style: STYLE_PRIMARY, onclick: exportPdf }, ["Save as PDF"]);
       var hint = el(
         "div",
@@ -585,29 +609,45 @@
     var paneEdit = el("div", { id: NS + "-pane-edit" });
     var paneFormat = el("div", { id: NS + "-pane-format", style: "display:none" });
 
-    var nextBtn = el("button", { style: STYLE_PRIMARY, onclick: function () {
-      setRemoveMode(false);
-      paneEdit.style.display = "none";
-      paneFormat.style.display = "";
+    // ---- stage breadcrumb (title bar): Link · Edit · Format --------------
+    var CRUMB_ON = "color:#18181b;font-weight:700";
+    var CRUMB_OFF = "color:#a1a1aa;font-weight:600";
+    function crumb(label, onclick) {
+      return el("a", {
+        href: "#",
+        style: "font-size:12px;text-decoration:none;cursor:pointer;" + CRUMB_OFF,
+        onclick: function (e) { e.preventDefault(); onclick(); },
+      }, [label]);
+    }
+    function crumbSep() {
+      return el("span", { style: "color:#d4d4d8;font-size:11px" }, ["›"]);
+    }
+    var cLink = crumb("Link", function () { newUrl(); });
+    var cEdit = crumb("Edit", function () { showPane("edit"); });
+    var cFormat = crumb("Format", function () { showPane("format"); });
+    titleSlot.appendChild(cLink);
+    titleSlot.appendChild(crumbSep());
+    titleSlot.appendChild(cEdit);
+    titleSlot.appendChild(crumbSep());
+    titleSlot.appendChild(cFormat);
+
+    // Switch panes and reflect it in the breadcrumb + the on-page preview.
+    function showPane(name) {
+      var editing = name === "edit";
+      paneEdit.style.display = editing ? "" : "none";
+      paneFormat.style.display = editing ? "none" : "";
+      if (editing) setRemoveMode(false);
+      cEdit.style.cssText = "font-size:12px;text-decoration:none;cursor:pointer;" + (editing ? CRUMB_ON : CRUMB_OFF);
+      cFormat.style.cssText = "font-size:12px;text-decoration:none;cursor:pointer;" + (editing ? CRUMB_OFF : CRUMB_ON);
+      // The Format stage previews the page as printed sheets.
+      state.previewMode = !editing;
+      render_style();
       panel.scrollTop = 0;
-    } }, ["Next: Format →"]);
+    }
 
-    var backLink = el("a", {
-      href: "#",
-      style: "font:11px system-ui;color:#2563eb;text-decoration:none;cursor:pointer",
-      onclick: function (e) {
-        e.preventDefault();
-        paneFormat.style.display = "none";
-        paneEdit.style.display = "";
-        panel.scrollTop = 0;
-      },
-    }, ["← Back to editing"]);
-    var newUrlLink = el("a", {
-      href: "#",
-      style: "font:11px system-ui;color:#71717a;text-decoration:none;cursor:pointer",
-      onclick: function (e) { e.preventDefault(); newUrl(); },
-    }, ["New URL"]);
-
+    var nextBtn = el("button", {
+      style: STYLE_PRIMARY, onclick: function () { showPane("format"); },
+    }, ["Next: Format →"]);
     var previewBtn = el("button", {
       style: STYLE_BTN + ";text-align:center", onclick: function () { nativeExport("preview"); },
     }, ["Preview PDF"]);
@@ -615,7 +655,7 @@
       style: STYLE_PRIMARY, onclick: function () { nativeExport("save"); },
     }, ["Save PDF"]);
 
-    // Pane 1
+    // Pane 1 (Edit)
     paneEdit.appendChild(removeBtn);
     paneEdit.appendChild(el("div", { style: "height:6px" }));
     paneEdit.appendChild(removeRow);
@@ -625,7 +665,7 @@
     paneEdit.appendChild(sep());
     paneEdit.appendChild(nextBtn);
 
-    // Pane 2
+    // Pane 2 (Format)
     paneFormat.appendChild(metaToggle);
     paneFormat.appendChild(metaFields);
     paneFormat.appendChild(sep());
@@ -647,15 +687,12 @@
     paneFormat.appendChild(previewBtn);
     paneFormat.appendChild(el("div", { style: "height:6px" }));
     paneFormat.appendChild(saveNativeBtn);
-    paneFormat.appendChild(
-      el("div", {
-        style: "display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px",
-      }, [backLink, newUrlLink])
-    );
 
     panel.appendChild(bar);
     panel.appendChild(paneEdit);
     panel.appendChild(paneFormat);
+    // Start on Edit (sets the breadcrumb highlight; preview off).
+    showPane("edit");
     return panel;
   }
 

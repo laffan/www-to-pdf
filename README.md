@@ -3,20 +3,26 @@
 Capture a website, tidy it up, and save it as a clean PDF.
 
 The native app is a **single window** (so it works on iOS, which forbids
-multiple windows) with an in-page toolbar that progresses through panes:
+multiple windows) with an in-page toolbar that progresses through panes. A
+**Link · Edit · Format** breadcrumb in the toolbar header tracks the stage and
+lets you jump straight back to any of them:
 
-1. **URL entry** — type or pick from your recent links. The one webview then
-   navigates to the site in place.
+1. **Link** — type a URL or pick from your recent links (each shows the page's
+   title once loaded). The one webview then navigates to the site in place.
+   Clicking **Link** in the breadcrumb returns here.
 2. **Edit** — log in if needed, then click elements to remove clutter (nav
    bars, cookie banners, ads…). Removal sets save as **presets**, re-applied on
    later visits or on other sites with the same layout (e.g. any Substack).
 3. **Format** — "Next" flips the toolbar to formatting: body size, line height,
    heading scale, per-side margins (US Letter), a sans-serif metadata header
    (title, URL, author, access date, notes), and header/footer with optional
-   page numbers — all applied live to the page.
+   page numbers — all applied live. Entering Format also reflows the live page
+   into a **PDF-sheet preview**: a centered white US-Letter sheet on a gray
+   backdrop, margins drawn as padding, so you see the printable layout as you
+   adjust it.
 4. **Preview / Save** — Preview renders the real PDF and opens it in the OS
    viewer (share sheet on iOS); Save writes it (save dialog on desktop, share
-   sheet on iOS). "New URL" returns to step 1.
+   sheet on iOS).
 
 It ships as a **web app** (GitHub Pages) and a **native app** (Tauri 2, desktop + iOS).
 
