@@ -1069,7 +1069,8 @@ pub fn run() {
                     // The first page that finishes loading is our own URL-entry
                     // page; remember it as "home" so "New URL" can return here.
                     {
-                        let mut home = load_handle.state::<AppState>().home.lock().unwrap();
+                        let state = load_handle.state::<AppState>();
+                        let mut home = state.home.lock().unwrap();
                         if home.is_none() {
                             *home = Some(payload.url().clone());
                         }
