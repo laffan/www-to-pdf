@@ -465,6 +465,50 @@ await appPage.close();
   await pvPage.close();
 }
 
+// 16b. Capture hides the preview overlay. The overlay (#wwwpdf-preview) is open,
+// covering the page, when a Format-stage render fires; the capture-prep style
+// (extracted from lib.rs) MUST hide it, or createPDF captures the overlay's
+// flat grey instead of the page — the "grey boxes" bug. Regression guard.
+{
+  const librs = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const prep = librs.match(/CAPTURE_PREP_JS: &str = r#"([\s\S]*?)"#;/);
+  const done = librs.match(/CAPTURE_DONE_JS: &str =\s*"([\s\S]*?)";/);
+  check("capture-prep + done scripts found in lib.rs", !!prep && !!done);
+  if (prep && done) {
+    const capPage = await browser.newPage();
+    await capPage.route("https://wwwtopdf.export/**", (route) => route.abort("aborted"));
+    await capPage.setContent(SAMPLE, { waitUntil: "load" });
+    await capPage.evaluate(() => { window.__TAURI_INTERNALS__ = {}; window.__WWWPDF_PRESETS = []; });
+    await capPage.addScriptTag({ content: EDITOR });
+    // Enter Format -> opens the (grey) preview overlay over the page.
+    await capPage.evaluate(() =>
+      [...document.querySelectorAll("#wwwpdf-panel a")].find((a) => a.textContent === "Format").click()
+    );
+    check("overlay is visible before capture", await capPage.evaluate(() => {
+      const ov = document.getElementById("wwwpdf-preview");
+      return !!ov && getComputedStyle(ov).display !== "none";
+    }));
+    // Run the exact capture-prep the native renderer runs before createPDF.
+    await capPage.evaluate((js) => window.eval(js), prep[1]);
+    check("capture-prep hides the preview overlay (no grey-box capture)", await capPage.evaluate(() =>
+      getComputedStyle(document.getElementById("wwwpdf-preview")).display === "none"
+    ));
+    check("capture-prep hides panel + toast but not the metadata header", await capPage.evaluate(() => {
+      const panelHidden = getComputedStyle(document.getElementById("wwwpdf-panel")).display === "none";
+      const cap = document.getElementById("wwwpdf-capture");
+      // The capture style must not target the metadata header (it belongs in the PDF).
+      const keepsMeta = !!cap && !/wwwpdf-meta/.test(cap.textContent);
+      return panelHidden && keepsMeta;
+    }));
+    // Capture-done restores the overlay so the render can draw into it.
+    await capPage.evaluate((js) => window.eval(js), done[1]);
+    check("capture-done restores the overlay", await capPage.evaluate(() =>
+      getComputedStyle(document.getElementById("wwwpdf-preview")).display !== "none"
+    ));
+    await capPage.close();
+  }
+}
+
 // 17. Phone form factor: the toolbar docks as a full-width bottom sheet so the
 // preview stays visible above it (rather than a floating card that covers it).
 {

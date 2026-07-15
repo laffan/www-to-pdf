@@ -706,7 +706,12 @@ const CAPTURE_PREP_JS: &str = r#"(function(){
   try{
     var st=document.getElementById('wwwpdf-capture');
     if(!st){st=document.createElement('style');st.id='wwwpdf-capture';
-      st.textContent='#wwwpdf-panel,#wwwpdf-toast{display:none!important}html::after{display:none!important}';
+      // Hide ALL of the tool's own chrome so createPDF captures only the page.
+      // #wwwpdf-preview is the full-screen inline-preview overlay: it is open
+      // (covering the page) when a Format-stage render fires, so if it isn't
+      // hidden the capture is just the overlay's flat grey — the "grey boxes"
+      // bug. The metadata header (#wwwpdf-meta) is intentionally NOT hidden.
+      st.textContent='#wwwpdf-panel,#wwwpdf-toast,#wwwpdf-preview{display:none!important}html::after{display:none!important}';
       document.documentElement.appendChild(st);}
     var d=document,b=d.body,e=d.documentElement;
     var h=Math.max(b?b.scrollHeight:0,e.scrollHeight,b?b.offsetHeight:0,e.offsetHeight);
