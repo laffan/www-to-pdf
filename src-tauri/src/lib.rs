@@ -1,21 +1,18 @@
 // www-to-pdf — native app entry point (Tauri 2)
 //
-// Four-stage flow:
-//   1. main window   — URL entry + history (local UI).
-//   2. target window — the remote page with a minimal injected toolbar
-//                      (log in, remove elements). "Next" fires a sentinel
-//                      navigation that we intercept below.
-//   3. preview window— local UI (same index.html, label "preview"): fonts,
-//                      metadata, margins, and a live preview that is the REAL
-//                      generated PDF (rendered to a temp file, displayed via
-//                      the asset protocol).
-//   4. save          — native save dialog (desktop) / share sheet (iOS),
-//                      copying the already-rendered preview so what you saw is
-//                      exactly what you save.
+// SINGLE WINDOW, PANE PROGRESSION (works on desktop AND iOS, which forbids
+// multiple windows). There is one webview:
+//   1. it starts on the bundled URL-entry page (index.html);
+//   2. `load_url` navigates that same webview to the target site, where the
+//      editor init-script mounts an in-page toolbar (Pane 1: remove/presets →
+//      Pane 2: fonts/metadata/margins/header-footer);
+//   3. the toolbar's Preview/Save/New-URL/preset actions are sentinel
+//      navigations the on_navigation hook cancels and turns into native work
+//      (render this webview, save/share, or go home). Sentinels are used
+//      because the remote page has no working Tauri IPC.
 //
-// The preview window is local, so it can use normal Tauri IPC. Only the
-// remote target webview needs the sentinel-navigation trick (app-command IPC
-// from dynamically-created remote webviews is denied by Tauri's ACL).
+// The renderer (createPDF + Rust pagination + stamping) is shared by macOS and
+// iOS; save is a dialog on desktop and the share sheet on iOS.
 
 use std::sync::Mutex;
 use tauri::{Manager, Url, WebviewUrl, WebviewWindowBuilder};
@@ -23,10 +20,10 @@ use tauri::{Manager, Url, WebviewUrl, WebviewWindowBuilder};
 // The shared editor engine, embedded so the native build is self-contained.
 const EDITOR_JS: &str = include_str!("../../public/editor.js");
 
-// The editor navigates here when stage 2 is done; see editor.js (STAGE3_HOST).
-const STAGE3_HOST: &str = "wwwtopdf.stage3";
-// Preset save/delete requests arrive the same way (editor.js PRESET_HOST).
-const PRESET_HOST: &str = "wwwtopdf.preset";
+// Sentinel hosts the editor navigates to; see editor.js.
+const EXPORT_HOST: &str = "wwwtopdf.export"; // ?action=save|preview&margins…
+const HOME_HOST: &str = "wwwtopdf.home"; // back to URL entry
+const PRESET_HOST: &str = "wwwtopdf.preset"; // ?action=save|update|delete…
 
 /// A saved removal set: CSS selectors recorded when elements were clicked,
 /// replayable on any page with similar markup. Stored in the app data dir;
@@ -132,7 +129,7 @@ fn handle_preset_nav(app: &tauri::AppHandle, url: &Url) {
         },
         _ => return,
     };
-    if let Some(w) = app.get_webview_window("target") {
+    if let Some(w) = app.get_webview_window("main") {
         let json = presets_json_for_js(&presets);
         let msg_js = serde_json::to_string(&msg).unwrap_or_else(|_| "\"\"".into());
         let _ = w.eval(&format!(
@@ -141,15 +138,10 @@ fn handle_preset_nav(app: &tauri::AppHandle, url: &Url) {
     }
 }
 
-#[derive(Clone, Default, serde::Serialize)]
-struct PageInfo {
-    title: String,
-    url: String,
-}
-
 #[derive(Default)]
 struct AppState {
-    page: Mutex<PageInfo>,
+    // The URL-entry page to return to when the user picks "New URL".
+    home: Mutex<Option<Url>>,
 }
 
 struct Margins {
@@ -160,159 +152,122 @@ struct Margins {
     left: f64,
 }
 
-/// Where the live preview PDF lives. Must stay inside the asset-protocol scope
-/// declared in tauri.conf.json ($TEMP/**).
+/// Where the rendered PDF lives before saving/sharing. Must stay inside the
+/// asset-protocol scope declared in tauri.conf.json ($TEMP/**).
 fn preview_path() -> std::path::PathBuf {
     std::env::temp_dir().join("wwwtopdf-preview.pdf")
 }
 
-/// Stage 1 → 2: open the URL in its own webview with the editor injected.
-#[tauri::command]
-fn open_target(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    let parsed: Url = url.parse().map_err(|e| format!("Invalid URL: {e}"))?;
-    let app_for_nav = app.clone();
-
-    // Saved presets ride along with the editor so the toolbar can list them
-    // immediately (the remote page has no IPC to ask with).
-    let init_script = format!(
-        "window.__WWWPDF_PRESETS = {};\n{}",
-        presets_json_for_js(&load_presets(&app)),
-        EDITOR_JS
-    );
-
-    WebviewWindowBuilder::new(&app, "target", WebviewUrl::External(parsed))
-        .title("www → pdf — page")
-        .initialization_script(init_script)
-        .inner_size(1024.0, 768.0)
-        .on_navigation(move |nav_url| {
-            if nav_url.host_str() == Some(STAGE3_HOST) {
-                stash_page_info(&app_for_nav, nav_url);
-                let app = app_for_nav.clone();
-                tauri::async_runtime::spawn(async move {
-                    open_preview(&app);
-                });
-                return false; // cancel — the edited page stays put
-            }
-            if nav_url.host_str() == Some(PRESET_HOST) {
-                let app = app_for_nav.clone();
-                let url = nav_url.clone();
-                tauri::async_runtime::spawn(async move {
-                    handle_preset_nav(&app, &url);
-                });
-                return false;
-            }
-            true
-        })
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+fn non_empty(s: String) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() { None } else { Some(t.to_string()) }
 }
 
-fn stash_page_info(app: &tauri::AppHandle, nav_url: &Url) {
+/// Report a render outcome back into the in-page editor's toast.
+fn report(app: &tauri::AppHandle, ok: bool, msg: &str) {
+    if let Some(w) = app.get_webview_window("main") {
+        let m = serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".into());
+        let _ = w.eval(&format!(
+            "window.wwwToPdf&&window.wwwToPdf.afterExport&&window.wwwToPdf.afterExport({ok},{m})"
+        ));
+    }
+}
+
+/// Navigate the single webview to a target URL (remembering the current app
+/// page as "home"). Called from the URL-entry UI, which has working IPC.
+#[tauri::command]
+fn load_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let parsed: Url = url.parse().map_err(|e| format!("Invalid URL: {e}"))?;
+    let webview = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window missing".to_string())?;
+    if let Ok(cur) = webview.url() {
+        *app.state::<AppState>().home.lock().unwrap() = Some(cur);
+    }
+    webview.navigate(parsed).map_err(|e| e.to_string())
+}
+
+/// Navigate back to the URL-entry page.
+fn go_home(app: &tauri::AppHandle) {
+    let home = app.state::<AppState>().home.lock().unwrap().clone();
+    if let (Some(webview), Some(u)) = (app.get_webview_window("main"), home) {
+        let _ = webview.navigate(u);
+    }
+}
+
+/// on_navigation hook: intercept sentinel navigations. Returns true if this was
+/// a sentinel (so the navigation should be cancelled), false to allow it.
+fn handle_sentinel(app: &tauri::AppHandle, nav_url: &Url) -> bool {
+    match nav_url.host_str() {
+        Some(EXPORT_HOST) => {
+            let app = app.clone();
+            let url = nav_url.clone();
+            tauri::async_runtime::spawn(async move { do_export(app, url).await });
+            true
+        }
+        Some(HOME_HOST) => {
+            go_home(app);
+            true
+        }
+        Some(PRESET_HOST) => {
+            let app = app.clone();
+            let url = nav_url.clone();
+            tauri::async_runtime::spawn(async move { handle_preset_nav(&app, &url) });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Render the current webview to the preview PDF, then save or preview it.
+async fn do_export(app: tauri::AppHandle, url: Url) {
     let get = |key: &str| -> String {
-        nav_url
-            .query_pairs()
+        url.query_pairs()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.into_owned())
             .unwrap_or_default()
     };
-    let info = PageInfo {
-        title: get("title"),
-        url: get("url"),
-    };
-    // Backfill the URL-entry history with the real page title (the main window
-    // only had the URL when the user clicked Load).
-    if !info.title.is_empty() && !info.url.is_empty() {
-        if let Some(main) = app.get_webview_window("main") {
-            let u = serde_json::to_string(&info.url).unwrap_or_else(|_| "\"\"".into());
-            let t = serde_json::to_string(&info.title).unwrap_or_else(|_| "\"\"".into());
-            let _ = main.eval(&format!(
-                "window.__wwwpdfSetHistoryTitle&&window.__wwwpdfSetHistoryTitle({u},{t})"
-            ));
-        }
-    }
-    *app.state::<AppState>().page.lock().unwrap() = info;
-}
-
-/// Stage 2 → 3: open (or refresh) the PDF-settings window.
-fn open_preview(app: &tauri::AppHandle) {
-    if let Some(w) = app.get_webview_window("preview") {
-        // Re-entry from stage 2: reload so the UI re-reads page info and
-        // renders a fresh preview of the current DOM.
-        let _ = w.eval("location.reload()");
-        let _ = w.set_focus();
-        return;
-    }
-    let _ = WebviewWindowBuilder::new(app, "preview", WebviewUrl::App("index.html".into()))
-        .title("www → pdf — output")
-        .inner_size(1150.0, 820.0)
-        .min_inner_size(760.0, 500.0)
-        .build();
-}
-
-/// Title/URL captured at the stage-2→3 hand-off, for prefilling metadata.
-#[tauri::command]
-fn get_page_info(state: tauri::State<'_, AppState>) -> PageInfo {
-    state.page.lock().unwrap().clone()
-}
-
-/// Stage 3: push font/metadata settings into the target page's DOM (they must
-/// live there to appear in the rendered PDF). eval works on any origin.
-#[tauri::command]
-fn apply_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(), String> {
-    let webview = app
-        .get_webview_window("target")
-        .ok_or_else(|| "The page window was closed — go back to the URL entry.".to_string())?;
-    let js = format!("window.wwwToPdf&&window.wwwToPdf.applySettings({settings})");
-    webview.eval(&js).map_err(|e| e.to_string())
-}
-
-/// Stage 3: render the current state of the target page to the preview PDF,
-/// then stamp header/footer/page numbers into the margins.
-/// Returns the file path; the UI displays it via the asset protocol.
-///
-/// MARGIN CONTRACT: WebKit computes the print *layout* width from the @page
-/// CSS injected in the target page, while NSPrintInfo margins control where
-/// each rendered tile is *placed* on the paper. The two must carry the same
-/// values or text reflows to the wrong width and gets cropped — so the UI
-/// sends margins both to apply_settings (CSS) and here (native).
-#[tauri::command]
-async fn render_preview(
-    app: tauri::AppHandle,
-    mt: f64,
-    mr: f64,
-    mb: f64,
-    ml: f64,
-    header: Option<String>,
-    footer: Option<String>,
-    page_numbers: Option<bool>,
-) -> Result<String, String> {
-    let webview = app
-        .get_webview_window("target")
-        .ok_or_else(|| "The page window was closed — go back to the URL entry.".to_string())?;
-    let clamp = |v: f64| v.clamp(0.0, 3.0);
+    let num = |key: &str| get(key).parse::<f64>().unwrap_or(1.0).clamp(0.0, 3.0);
     let m = Margins {
-        top: clamp(mt),
-        right: clamp(mr),
-        bottom: clamp(mb),
-        left: clamp(ml),
+        top: num("mt"),
+        right: num("mr"),
+        bottom: num("mb"),
+        left: num("ml"),
     };
+    let header = non_empty(get("header"));
+    let footer = non_empty(get("footer"));
+    let page_numbers = get("pagenum") == "1";
+    let action = get("action");
+    let title = get("title");
+
     let out = preview_path();
     let out_str = out.to_string_lossy().into_owned();
-    render_pdf(&webview, &m, &out_str).await?;
 
-    fn non_empty(o: &Option<String>) -> Option<&str> {
-        o.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    let render = async {
+        let webview = app
+            .get_webview_window("main")
+            .ok_or_else(|| "main window missing".to_string())?;
+        render_pdf(&webview, &m, &out_str).await?;
+        stamp_header_footer(&out_str, &m, header.as_deref(), footer.as_deref(), page_numbers)?;
+        Ok::<(), String>(())
     }
-    stamp_header_footer(
-        &out_str,
-        &m,
-        non_empty(&header),
-        non_empty(&footer),
-        page_numbers.unwrap_or(false),
-    )?;
-    Ok(out_str)
+    .await;
+
+    if let Err(e) = render {
+        report(&app, false, &e);
+        return;
+    }
+
+    let outcome = if action == "preview" {
+        present_preview(&app, &out_str).await
+    } else {
+        present_save(&app, &out_str, &title).await
+    };
+    match outcome {
+        Ok(Some(path)) => report(&app, true, &format!("Saved → {path}")),
+        Ok(None) => report(&app, true, "Done"),
+        Err(e) => report(&app, false, &e),
+    }
 }
 
 // ---- header/footer stamping (pure Rust, all platforms) ---------------------
@@ -493,55 +448,89 @@ fn add_stamp_font(
     Ok(())
 }
 
-/// Stage 4: ask where to save (desktop) or share (iOS). The preview file IS
-/// the current PDF, so saving is a copy — guaranteed to match what was shown.
-/// Returns Some(path) on save, None if the user cancelled.
-#[cfg(not(target_os = "ios"))]
-#[tauri::command]
-async fn save_pdf(app: tauri::AppHandle, suggested: String) -> Result<Option<String>, String> {
-    use tauri_plugin_dialog::DialogExt;
+// ---- presenting the rendered PDF (save / preview) --------------------------
+// Desktop: Save opens a native save dialog and copies the preview file;
+// Preview opens it in the OS PDF viewer. iOS: both go through the share sheet
+// (which offers preview + save-to-Files). Returns Some(path) on save, None
+// otherwise (cancelled / handed to the OS).
 
-    let src = preview_path();
-    if !src.exists() {
-        return Err("No rendered PDF yet — adjust a setting to generate one.".into());
+/// Save: native dialog on desktop, share sheet on iOS.
+async fn present_save(
+    app: &tauri::AppHandle,
+    src: &str,
+    suggested: &str,
+) -> Result<Option<String>, String> {
+    if !std::path::Path::new(src).exists() {
+        return Err("No rendered PDF to save.".into());
     }
-
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .add_filter("PDF", &["pdf"])
-        .set_file_name(format!("{}.pdf", sanitize(&suggested)))
-        .save_file(move |picked| {
-            let _ = tx.send(picked);
-        });
-
-    let picked = rx.await.map_err(|_| "save dialog closed unexpectedly".to_string())?;
-    match picked {
-        Some(file_path) => {
-            let dest = file_path.into_path().map_err(|e| e.to_string())?;
-            std::fs::copy(&src, &dest).map_err(|e| format!("Could not write PDF: {e}"))?;
-            Ok(Some(dest.to_string_lossy().into_owned()))
+    #[cfg(target_os = "ios")]
+    {
+        let _ = suggested;
+        ios_share(app, src)?;
+        return Ok(None);
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        use tauri_plugin_dialog::DialogExt;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.dialog()
+            .file()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(format!("{}.pdf", sanitize(suggested)))
+            .save_file(move |picked| {
+                let _ = tx.send(picked);
+            });
+        let picked = rx.await.map_err(|_| "save dialog closed unexpectedly".to_string())?;
+        match picked {
+            Some(file_path) => {
+                let dest = file_path.into_path().map_err(|e| e.to_string())?;
+                std::fs::copy(src, &dest).map_err(|e| format!("Could not write PDF: {e}"))?;
+                Ok(Some(dest.to_string_lossy().into_owned()))
+            }
+            None => Ok(None),
         }
-        None => Ok(None),
     }
 }
 
-/// iOS: hand the PDF to the share sheet (UIActivityViewController).
+/// Preview: open in the OS viewer on desktop, share sheet on iOS.
+async fn present_preview(app: &tauri::AppHandle, src: &str) -> Result<Option<String>, String> {
+    if !std::path::Path::new(src).exists() {
+        return Err("No rendered PDF to preview.".into());
+    }
+    // Each arm uses an explicit `return` so that after cfg-stripping the kept
+    // block diverges regardless of whether it lands in statement or tail
+    // position (avoids the "middle cfg block parsed as a statement" gotcha).
+    #[cfg(target_os = "ios")]
+    {
+        ios_share(app, src)?;
+        return Ok(None);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        std::process::Command::new("open")
+            .arg(src)
+            .spawn()
+            .map_err(|e| format!("Could not open PDF: {e}"))?;
+        return Ok(None);
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+    {
+        let _ = (app, src);
+        return Err("Preview is only implemented on macOS and iOS.".into());
+    }
+}
+
+/// iOS share sheet (UIActivityViewController) anchored on the webview.
 #[cfg(target_os = "ios")]
-#[tauri::command]
-async fn save_pdf(app: tauri::AppHandle, _suggested: String) -> Result<Option<String>, String> {
+fn ios_share(app: &tauri::AppHandle, src: &str) -> Result<(), String> {
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};
 
-    let src = preview_path();
-    if !src.exists() {
-        return Err("No rendered PDF yet — adjust a setting to generate one.".into());
-    }
     let webview = app
-        .get_webview_window("target")
-        .ok_or_else(|| "The page window was closed.".to_string())?;
-    let path = src.to_string_lossy().into_owned();
-
+        .get_webview_window("main")
+        .ok_or_else(|| "main window missing".to_string())?;
+    let path = src.to_string();
     webview
         .with_webview(move |platform| unsafe {
             let vc = platform.view_controller() as *mut AnyObject;
@@ -560,7 +549,6 @@ async fn save_pdf(app: tauri::AppHandle, _suggested: String) -> Result<Option<St
                 initWithActivityItems: items,
                 applicationActivities: std::ptr::null_mut::<AnyObject>()
             ];
-            // iPad requires a popover anchor.
             let popover: *mut AnyObject = msg_send![avc, popoverPresentationController];
             if !popover.is_null() && !view.is_null() {
                 let _: () = msg_send![popover, setSourceView: view];
@@ -573,8 +561,7 @@ async fn save_pdf(app: tauri::AppHandle, _suggested: String) -> Result<Option<St
             ];
         })
         .map_err(|e| e.to_string())?;
-
-    Ok(Some("(share sheet)".into()))
+    Ok(())
 }
 
 fn sanitize(s: &str) -> String {
@@ -1066,13 +1053,42 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![
-            open_target,
-            get_page_info,
-            apply_settings,
-            render_preview,
-            save_pdf
-        ])
+        .invoke_handler(tauri::generate_handler![load_url])
+        .setup(|app| {
+            // The one and only window/webview: starts on the bundled URL-entry
+            // page, then navigates to target sites in place. The editor engine
+            // is installed as an init script (runs on every page, remote or
+            // local — it suppresses itself on our own page via __WWWPDF_IS_APP).
+            let handle = app.handle().clone();
+            let init = format!(
+                "window.__WWWPDF_PRESETS = {};\n{}",
+                presets_json_for_js(&load_presets(&handle)),
+                EDITOR_JS
+            );
+            let nav_handle = handle.clone();
+            let load_handle = handle.clone();
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                .title("Prepare source")
+                .inner_size(1100.0, 800.0)
+                .min_inner_size(380.0, 480.0)
+                .initialization_script(init)
+                .on_navigation(move |url| !handle_sentinel(&nav_handle, url))
+                .on_page_load(move |_wv, payload| {
+                    // Push the current presets to each freshly-loaded page so a
+                    // page opened after a preset change isn't stuck with the
+                    // startup snapshot from the init script.
+                    if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                        if let Some(w) = load_handle.get_webview_window("main") {
+                            let json = presets_json_for_js(&load_presets(&load_handle));
+                            let _ = w.eval(&format!(
+                                "window.wwwToPdf&&window.wwwToPdf.presetsUpdated&&window.wwwToPdf.presetsUpdated({json})"
+                            ));
+                        }
+                    }
+                })
+                .build()?;
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running www-to-pdf");
 }

@@ -10,6 +10,10 @@
     />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%84%3C/text%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/src/ui.css" />
+    <!-- Tell the injected editor engine this is the app's own page, so it does
+         not mount its toolbar here (the same webview later navigates to remote
+         sites, where the engine does mount). -->
+    <script>window.__WWWPDF_IS_APP = true;</script>
   </head>
   <body>
     <!-- ============ SCREEN 1: URL ENTRY ============ -->
@@ -28,70 +32,7 @@
       <ul id="history" class="history"></ul>
     </main>
 
-    <!-- ============ SCREEN 3 (native): PDF SETTINGS + LIVE PREVIEW ============ -->
-    <div id="pdf-settings" class="pv" hidden>
-      <aside class="pv-side">
-        <label class="pv-check">
-          <input id="pv-meta-on" type="checkbox" />
-          <span>Include metadata header</span>
-        </label>
-        <div id="pv-meta-fields" class="pv-fields" hidden>
-          <label>Title <input id="pv-title" type="text" /></label>
-          <label>URL <input id="pv-url" type="text" /></label>
-          <label>Author <input id="pv-author" type="text" /></label>
-          <label>Access date <input id="pv-date" type="date" /></label>
-          <label>Notes <input id="pv-notes" type="text" /></label>
-        </div>
-
-        <div class="pv-sep"></div>
-
-        <div class="pv-slider">
-          <div class="pv-slider-head"><span>Body text</span><span id="pv-body-out">16px</span></div>
-          <input id="pv-body" type="range" min="12" max="28" step="1" value="16" />
-        </div>
-        <div class="pv-slider">
-          <div class="pv-slider-head"><span>Line height</span><span id="pv-line-out">1.60</span></div>
-          <input id="pv-line" type="range" min="1" max="2.2" step="0.05" value="1.6" />
-        </div>
-        <div class="pv-slider">
-          <div class="pv-slider-head"><span>Heading size</span><span id="pv-head-out">100%</span></div>
-          <input id="pv-head" type="range" min="0.6" max="2" step="0.05" value="1" />
-        </div>
-
-        <div class="pv-sep"></div>
-
-        <div class="pv-label">Page — US Letter (8.5 × 11 in) · margins</div>
-        <div class="pv-margins">
-          <label>Top (in) <input id="pv-mt" type="number" min="0" max="3" step="0.05" value="1" /></label>
-          <label>Right (in) <input id="pv-mr" type="number" min="0" max="3" step="0.05" value="1" /></label>
-          <label>Bottom (in) <input id="pv-mb" type="number" min="0" max="3" step="0.05" value="1" /></label>
-          <label>Left (in) <input id="pv-ml" type="number" min="0" max="3" step="0.05" value="1" /></label>
-        </div>
-
-        <div class="pv-sep"></div>
-
-        <div class="pv-label">Header &amp; footer (printed in the margins)</div>
-        <div class="pv-fields">
-          <label>Header text <input id="pv-header" type="text" placeholder="e.g. article title" /></label>
-          <label>Footer text <input id="pv-footer" type="text" placeholder="e.g. source URL" /></label>
-        </div>
-        <label class="pv-check">
-          <input id="pv-pagenum" type="checkbox" />
-          <span>Page numbers</span>
-        </label>
-
-        <div class="pv-sep"></div>
-
-        <button id="pv-save" class="primary">Save PDF…</button>
-        <p id="pv-status" class="pv-status"></p>
-      </aside>
-      <div class="pv-stage">
-        <iframe id="pv-frame" title="PDF preview"></iframe>
-        <div id="pv-loading" class="pv-loading" hidden>Rendering…</div>
-      </div>
-    </div>
-
-    <!-- ============ SCREEN 2: VIEWER ============ -->
+    <!-- ============ SCREEN 2 (web build only): IFRAME VIEWER ============ -->
     <div id="viewer" class="viewer" hidden>
       <div class="viewer-bar">
         <button id="back-btn" class="ghost" title="New URL">← New URL</button>

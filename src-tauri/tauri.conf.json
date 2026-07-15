@@ -10,15 +10,7 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
-    "windows": [
-      {
-        "title": "www → pdf",
-        "width": 480,
-        "height": 720,
-        "minWidth": 360,
-        "resizable": true
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null,
       "assetProtocol": {

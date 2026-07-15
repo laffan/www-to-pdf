@@ -27,19 +27,10 @@ async function tauriInvoke(cmd, args) {
   return invoke(cmd, args);
 }
 
-// ---- boot: decide which screen this window shows ---------------------------
-// The native preview window reuses this same index.html with label "preview".
-// NOTE: called at the very end of this module — it must not run before the
-// module-level consts below are initialized (TDZ).
-async function boot() {
-  if (isTauri) {
-    const { getCurrentWindow } = await import("@tauri-apps/api/window");
-    if (getCurrentWindow().label === "preview") {
-      entry.hidden = true;
-      initPreview();
-      return;
-    }
-  }
+// ---- boot -------------------------------------------------------------------
+// Single window: this page is always the URL-entry screen. In the app it also
+// navigates in place to target sites, where the injected editor takes over.
+function boot() {
   renderHistory();
 }
 
@@ -144,10 +135,10 @@ function load(url) {
   $("entry-error").hidden = true;
   pushHistory(url);
 
-  // Native app: hand the URL to Rust, which opens a webview with the editor
-  // already injected. No iframe, no cross-origin limits.
+  // Native app: hand the URL to Rust, which navigates this single webview to
+  // the page (the injected editor takes over there). No iframe, no limits.
   if (isTauri) {
-    tauriInvoke("open_target", { url }).catch((e) =>
+    tauriInvoke("load_url", { url }).catch((e) =>
       showEntryError("Could not open page: " + e)
     );
     return;
@@ -249,145 +240,6 @@ $("open-tab").addEventListener("click", () => {
   if (url) window.open(url, "_blank", "noopener");
 });
 
-// ============ STAGE 3 (native): PDF settings + live preview ============
-// Runs in the "preview" window. Drives three commands:
-//   apply_settings  -> evals font/metadata changes into the target page
-//   render_preview  -> renders the real PDF to a temp file (shown in iframe)
-//   save_pdf        -> native save dialog (share sheet on iOS), copies preview
-async function initPreview() {
-  const { invoke, convertFileSrc } = await import("@tauri-apps/api/core");
-  const screen = $("pdf-settings");
-  screen.hidden = false;
-
-  const frame = $("pv-frame");
-  const status = $("pv-status");
-  const loading = $("pv-loading");
-
-  // Prefill metadata from the page we came from.
-  let info = { title: "", url: "" };
-  try {
-    info = await invoke("get_page_info");
-  } catch {}
-  $("pv-title").value = info.title || "";
-  $("pv-url").value = info.url || "";
-  $("pv-date").value = new Date().toISOString().slice(0, 10);
-
-  const val = (id) => $(id).value;
-  const num = (id) => {
-    const v = parseFloat($(id).value);
-    return isNaN(v) ? 0 : Math.max(0, Math.min(3, v));
-  };
-  // IMPORTANT: margins ship in BOTH payloads. The page's @page CSS drives
-  // WebKit's print *layout* width, while the native NSPrintInfo margins drive
-  // tile *placement*. If they disagree, text reflows to the wrong width and
-  // gets cropped — so the same values go to apply_settings (CSS) and
-  // render_preview (native).
-  const margins = () => ({
-    top: num("pv-mt"),
-    right: num("pv-mr"),
-    bottom: num("pv-mb"),
-    left: num("pv-ml"),
-  });
-  const settings = () => ({
-    bodyPx: parseInt($("pv-body").value, 10),
-    lineHeight: parseFloat($("pv-line").value),
-    headingScale: parseFloat($("pv-head").value),
-    margins: margins(),
-    meta: {
-      show: $("pv-meta-on").checked,
-      title: val("pv-title"),
-      url: val("pv-url"),
-      author: val("pv-author"),
-      accessDate: val("pv-date"),
-      notes: val("pv-notes"),
-    },
-  });
-
-  // Serialized refresh: never two renders in flight; a change during a render
-  // queues exactly one follow-up.
-  let rendering = false;
-  let queued = false;
-  async function refresh() {
-    if (rendering) {
-      queued = true;
-      return;
-    }
-    rendering = true;
-    loading.hidden = false;
-    status.textContent = "";
-    try {
-      await invoke("apply_settings", { settings: settings() });
-      const m = margins();
-      const path = await invoke("render_preview", {
-        mt: m.top,
-        mr: m.right,
-        mb: m.bottom,
-        ml: m.left,
-        header: val("pv-header") || null,
-        footer: val("pv-footer") || null,
-        pageNumbers: $("pv-pagenum").checked,
-      });
-      frame.src = convertFileSrc(path) + "?t=" + Date.now();
-    } catch (e) {
-      status.textContent = "Preview failed: " + e;
-    } finally {
-      loading.hidden = true;
-      rendering = false;
-      if (queued) {
-        queued = false;
-        refresh();
-      }
-    }
-  }
-
-  let debounceTimer = null;
-  function scheduleRefresh() {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(refresh, 400);
-  }
-
-  // Wire every control.
-  $("pv-meta-on").addEventListener("change", () => {
-    $("pv-meta-fields").hidden = !$("pv-meta-on").checked;
-    scheduleRefresh();
-  });
-  for (const id of ["pv-title", "pv-url", "pv-author", "pv-date", "pv-notes"]) {
-    $(id).addEventListener("input", scheduleRefresh);
-  }
-  $("pv-body").addEventListener("input", () => {
-    $("pv-body-out").textContent = $("pv-body").value + "px";
-    scheduleRefresh();
-  });
-  $("pv-line").addEventListener("input", () => {
-    $("pv-line-out").textContent = parseFloat($("pv-line").value).toFixed(2);
-    scheduleRefresh();
-  });
-  $("pv-head").addEventListener("input", () => {
-    $("pv-head-out").textContent =
-      Math.round(parseFloat($("pv-head").value) * 100) + "%";
-    scheduleRefresh();
-  });
-  for (const id of ["pv-mt", "pv-mr", "pv-mb", "pv-ml", "pv-header", "pv-footer"]) {
-    $(id).addEventListener("input", scheduleRefresh);
-  }
-  $("pv-pagenum").addEventListener("change", scheduleRefresh);
-
-  // Stage 4: save.
-  $("pv-save").addEventListener("click", async () => {
-    status.textContent = "";
-    try {
-      const saved = await invoke("save_pdf", {
-        suggested: val("pv-title") || "page",
-      });
-      status.textContent = saved ? "Saved → " + saved : "Cancelled.";
-    } catch (e) {
-      status.textContent = "Save failed: " + e;
-    }
-  });
-
-  // Initial render.
-  refresh();
-}
 
 // Everything above is initialized — safe to boot.
 boot();

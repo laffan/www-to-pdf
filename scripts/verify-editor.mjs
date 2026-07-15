@@ -107,31 +107,18 @@ check("metadata survives hostile site CSS", await page.evaluate(() => {
   return cs.display !== "none" && !/georgia/i.test(cs.fontFamily);
 }));
 
-// 7. applySettings drives fonts + metadata (the stage-3 preview window path)
-await page.evaluate(() =>
-  window.wwwToPdf.applySettings({
-    bodyPx: 18,
-    headingScale: 1.5,
-    margins: { top: 0.75 },
-    meta: { show: true, author: "Test Author" },
-  })
-);
-check("applySettings sets body font", await page.evaluate(() =>
-  Math.round(parseFloat(getComputedStyle(document.getElementById("para")).fontSize)) === 18
-));
-await page.evaluate(() => window.wwwToPdf.applySettings({ lineHeight: 2.0 }));
-check("applySettings sets line height", await page.evaluate(() => {
+// 7. line-height slider (second range in the web panel) applies to the DOM
+await page.evaluate(() => {
+  const ranges = document.querySelectorAll('#wwwpdf-panel input[type=range]');
+  ranges[1].value = 2.0; // 0=body, 1=line height, 2=heading
+  ranges[1].dispatchEvent(new Event("input"));
+});
+check("line-height slider applies", await page.evaluate(() => {
   const p = document.getElementById("para");
   const lh = parseFloat(getComputedStyle(p).lineHeight);
   const fs = parseFloat(getComputedStyle(p).fontSize);
   return Math.abs(lh / fs - 2.0) < 0.05;
 }));
-check("applySettings updates @page margins", await page.evaluate(() =>
-  document.getElementById("wwwpdf-style").textContent.includes("margin:0.75in")
-));
-check("applySettings updates metadata", await page.evaluate(() =>
-  document.getElementById("wwwpdf-meta").textContent.includes("Test Author")
-));
 
 // 8. unmount removes the panel
 await page.evaluate(() => window.wwwToPdf.unmount());
@@ -194,18 +181,34 @@ await page2.evaluate(() => {
     { id: "p1", name: "Kill nav+footer", host: location.hostname, selectors: ["#nav", "#foot"] },
   ];
 });
+// Capture export/home sentinels too.
+let exportNavUrl = null;
+let homeNav = false;
+await page2.route("https://wwwtopdf.export/**", (route) => {
+  exportNavUrl = route.request().url();
+  route.abort("aborted");
+});
+await page2.route("https://wwwtopdf.home/**", (route) => {
+  homeNav = true;
+  route.abort("aborted");
+});
 await page2.addScriptTag({ content: EDITOR });
-check("tauri panel has Next button", await page2.evaluate(() =>
-  [...document.querySelectorAll("#wwwpdf-panel button")].some((b) =>
-    b.textContent.includes("PDF settings")
-  )
-));
-check("tauri panel has no sliders/save", await page2.evaluate(() =>
-  document.querySelectorAll("#wwwpdf-panel input[type=range]").length === 0 &&
-  ![...document.querySelectorAll("#wwwpdf-panel button")].some((b) =>
-    b.textContent.includes("Save as PDF")
-  )
-));
+
+// Native two-pane flow: Pane 1 (Edit) shows first with Next; format controls
+// live in Pane 2 (hidden until Next).
+check("native shows edit pane with 'Next: Format', format pane hidden", await page2.evaluate(() => {
+  const edit = document.getElementById("wwwpdf-pane-edit");
+  const fmt = document.getElementById("wwwpdf-pane-format");
+  const hasNext = [...document.querySelectorAll("#wwwpdf-panel button")]
+    .some((b) => b.textContent.includes("Next: Format"));
+  return edit && fmt && hasNext &&
+    getComputedStyle(edit).display !== "none" &&
+    getComputedStyle(fmt).display === "none";
+}));
+check("edit pane has no sliders (those are in format pane)", await page2.evaluate(() => {
+  const edit = document.getElementById("wwwpdf-pane-edit");
+  return edit.querySelectorAll('input[type=range]').length === 0;
+}));
 
 // 11. Presets dropdown: "No Preset" first, then this-site preset starred.
 check("dropdown has No Preset first, host preset starred", await page2.evaluate(() => {
@@ -303,6 +306,79 @@ check("presetsUpdated refreshes the list, keeps No Preset", await page2.evaluate
   return opts.length === 2 && opts[0].textContent === "No Preset" &&
     opts[1].textContent.includes("Fresh");
 }));
+
+// 12. Progression: Next reveals the format pane with all controls.
+check("Next reveals format pane; edit pane hidden", await page2.evaluate(() => {
+  [...document.querySelectorAll("#wwwpdf-panel button")]
+    .find((b) => b.textContent.includes("Next: Format")).click();
+  const edit = document.getElementById("wwwpdf-pane-edit");
+  const fmt = document.getElementById("wwwpdf-pane-format");
+  return getComputedStyle(edit).display === "none" &&
+    getComputedStyle(fmt).display !== "none" &&
+    fmt.querySelectorAll("input[type=range]").length === 3 &&      // body/line/heading
+    fmt.querySelectorAll("input[type=number]").length === 4;       // margins
+}));
+check("format pane has header/footer + page-numbers", await page2.evaluate(() => {
+  const fmt = document.getElementById("wwwpdf-pane-format");
+  const texts = [...fmt.querySelectorAll("input[type=text]")];
+  const checks = [...fmt.querySelectorAll("input[type=checkbox]")];
+  return texts.length >= 2 && checks.length >= 3; // meta-toggle, guide, page-numbers
+}));
+
+// 13. Save/Preview fire the export sentinel with margins + header/footer/pagenum.
+await page2.evaluate(() => {
+  // set a margin, header text, page numbers via the format controls
+  const fmt = document.getElementById("wwwpdf-pane-format");
+  const right = fmt.querySelectorAll("input[type=number]")[1]; // top,right,bottom,left
+  right.value = "1.5"; right.dispatchEvent(new Event("input"));
+  const hdr = [...fmt.querySelectorAll("input[type=text]")]
+    .find((i) => (i.placeholder || "").includes("article title"));
+  hdr.value = "My Header"; hdr.dispatchEvent(new Event("input"));
+});
+await page2.evaluate(() => {
+  [...document.querySelectorAll("#wwwpdf-panel button")]
+    .find((b) => b.textContent === "Save PDF").click();
+});
+await page2.waitForTimeout(200);
+check("Save fires export sentinel with action=save + params", (() => {
+  if (!exportNavUrl) return false;
+  const u = new URL(exportNavUrl);
+  return u.hostname === "wwwtopdf.export" &&
+    u.searchParams.get("action") === "save" &&
+    u.searchParams.get("mr") === "1.5" &&
+    u.searchParams.get("header") === "My Header";
+})());
+await page2.evaluate(() => {
+  exportNavUrl = null;
+  [...document.querySelectorAll("#wwwpdf-panel button")]
+    .find((b) => b.textContent === "Preview PDF").click();
+});
+await page2.waitForTimeout(200);
+check("Preview fires export sentinel with action=preview", (() => {
+  if (!exportNavUrl) return false;
+  return new URL(exportNavUrl).searchParams.get("action") === "preview";
+})());
+
+// 14. New URL fires the home sentinel.
+await page2.evaluate(() => {
+  [...document.querySelectorAll("#wwwpdf-panel a")]
+    .find((a) => a.textContent === "New URL").click();
+});
+await page2.waitForTimeout(200);
+check("New URL fires home sentinel", homeNav);
+
+// 15. The editor does not mount on our own app page (__WWWPDF_IS_APP).
+const appPage = await browser.newPage();
+await appPage.setContent(`<body></body>`, { waitUntil: "load" });
+await appPage.evaluate(() => {
+  window.__TAURI_INTERNALS__ = {};
+  window.__WWWPDF_IS_APP = true;
+});
+await appPage.addScriptTag({ content: EDITOR });
+check("editor suppressed on the app's own page", await appPage.evaluate(() =>
+  !document.getElementById("wwwpdf-panel")
+));
+await appPage.close();
 
 await browser.close();
 

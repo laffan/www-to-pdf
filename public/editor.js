@@ -34,6 +34,10 @@
     // US Letter output; margins in inches.
     margins: { top: 1, right: 1, bottom: 1, left: 1 },
     marginGuide: false,
+    // Header/footer are stamped onto the rendered PDF by the native side.
+    header: "",
+    footer: "",
+    pageNumbers: false,
     meta: {
       title: document.title || "",
       url: location.href,
@@ -313,6 +317,7 @@
     "padding:11px 12px;font:600 14px system-ui,sans-serif;cursor:pointer;width:100%";
 
   function buildPanel() {
+    var isNative = !!window.__TAURI_INTERNALS__;
     var panel = el("div", {
       id: NS + "-panel",
       style:
@@ -325,6 +330,10 @@
         "box-shadow:0 12px 40px rgba(0,0,0,.22);font:13px system-ui,-apple-system,sans-serif;" +
         "color:#18181b;padding:12px",
     });
+
+    function sep() {
+      return el("div", { style: "height:1px;background:#ececf0;margin:10px 0" });
+    }
 
     // drag handle / title bar
     var bar = el(
@@ -350,12 +359,11 @@
     );
     makeDraggable(panel, bar);
 
-    // metadata section
+    // ---- metadata section ----
     var metaFields = el("div", {
       id: NS + "-metafields",
-      style: "display:none;margin-top:8px;display:grid;gap:6px",
+      style: "display:none;margin-top:8px;gap:6px",
     });
-    metaFields.style.display = "none";
     function field(label, key, type) {
       var input = el("input", {
         type: type || "text",
@@ -394,7 +402,7 @@
       ]
     );
 
-    // remove section
+    // ---- remove section ----
     var removeBtn = el("button", {
       id: NS + "-removebtn",
       style: STYLE_BTN,
@@ -405,230 +413,16 @@
     });
     removeBtn.textContent = "Remove elements";
     var removeRow = el("div", { style: "display:flex;gap:6px;align-items:center" }, [
-      el(
-        "button",
-        { style: STYLE_BTN + ";width:auto;flex:1", onclick: undo },
-        ["Undo"]
-      ),
-      el(
-        "button",
-        { style: STYLE_BTN + ";width:auto;flex:1", onclick: resetRemoved },
-        ["Reset"]
-      ),
+      el("button", { style: STYLE_BTN + ";width:auto;flex:1", onclick: undo }, ["Undo"]),
+      el("button", { style: STYLE_BTN + ";width:auto;flex:1", onclick: resetRemoved }, ["Reset"]),
     ]);
     var count = el("div", {
       id: NS + "-count",
       style: "font-size:11px;color:#71717a;text-align:right",
     });
-    count.textContent = "0 removed";
+    count.textContent = state.removed.length + " removed";
 
-    // Native app (stage 2): the page is for logging in and adding/removing
-    // material only. Fonts, metadata, and margins live in the PDF-settings
-    // window (stage 3), which previews the real generated PDF.
-    if (window.__TAURI_INTERNALS__) {
-      var nextBtn = el(
-        "button",
-        { style: STYLE_PRIMARY, onclick: gotoStage3 },
-        ["Next: PDF settings →"]
-      );
-      var divider = function () {
-        return el("div", { style: "height:1px;background:#ececf0;margin:10px 0" });
-      };
-
-      // -- presets: saved removal sets, injected by the app at load time --
-      var presets = Array.isArray(window.__WWWPDF_PRESETS)
-        ? window.__WWWPDF_PRESETS
-        : [];
-      var hostKey = function (h) {
-        return (h || "").replace(/^www\./, "");
-      };
-      var NO_PRESET = "";
-
-      // Dropdown: "No Preset" first, then presets (this-site starred + first).
-      var presetSel = el("select", {
-        id: NS + "-preset-sel",
-        style:
-          "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:7px;" +
-          "padding:7px 8px;font:12px system-ui;background:#fff;color:#18181b",
-        onchange: function () {
-          refreshUpdateLink();
-          var p = currentPreset();
-          if (p) applyPreset(p);
-        },
-      });
-      function sortedPresets() {
-        var here = hostKey(location.hostname);
-        return presets.slice().sort(function (a, b) {
-          var am = hostKey(a.host) === here ? 0 : 1;
-          var bm = hostKey(b.host) === here ? 0 : 1;
-          if (am !== bm) return am - bm;
-          return a.name < b.name ? -1 : 1;
-        });
-      }
-      function rebuildPresetOptions() {
-        var keep = presetSel.value;
-        presetSel.textContent = "";
-        var here = hostKey(location.hostname);
-        var none = document.createElement("option");
-        none.value = NO_PRESET;
-        none.textContent = "No Preset";
-        presetSel.appendChild(none);
-        sortedPresets().forEach(function (p) {
-          var o = document.createElement("option");
-          o.value = p.id;
-          o.textContent = (hostKey(p.host) === here ? "★ " : "") + p.name;
-          presetSel.appendChild(o);
-        });
-        // Preserve selection if it still exists, else fall back to No Preset.
-        presetSel.value = presets.some(function (p) { return p.id === keep; })
-          ? keep
-          : NO_PRESET;
-      }
-      function currentPreset() {
-        var id = presetSel.value;
-        for (var i = 0; i < presets.length; i++) {
-          if (presets[i].id === id) return presets[i];
-        }
-        return null;
-      }
-      function currentSelectors() {
-        var sels = [];
-        state.removed.forEach(function (r) {
-          if (r.sel && sels.indexOf(r.sel) < 0) sels.push(r.sel);
-        });
-        return sels;
-      }
-      function presetNav(params) {
-        window.location.href = "https://" + PRESET_HOST + "/?" + params;
-      }
-
-      // -- collapsible editor (Save new / Update selected / Delete selected) --
-      var nameInput = el("input", {
-        type: "text",
-        placeholder: "New preset name",
-        value: hostKey(location.hostname),
-        style:
-          "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:7px;" +
-          "padding:7px 8px;font:12px system-ui",
-      });
-      var saveBtn = el(
-        "button",
-        {
-          style: STYLE_BTN + ";width:auto;flex:none;text-align:center",
-          onclick: function () {
-            var sels = currentSelectors();
-            if (!sels.length) return toast("Click some elements to remove first");
-            var name = (nameInput.value || "").trim() || hostKey(location.hostname);
-            presetNav(
-              "action=save&name=" + encodeURIComponent(name) +
-              "&host=" + encodeURIComponent(location.hostname) +
-              "&sels=" + encodeURIComponent(JSON.stringify(sels))
-            );
-          },
-        },
-        ["Save new"]
-      );
-      var deleteBtn = el(
-        "button",
-        {
-          style: STYLE_BTN + ";text-align:center;color:#dc2626",
-          onclick: function () {
-            var p = currentPreset();
-            if (!p) return toast("Select a preset to delete");
-            presetNav("action=delete&id=" + encodeURIComponent(p.id));
-          },
-        },
-        ["Delete selected"]
-      );
-      var editorBox = el(
-        "div",
-        {
-          id: NS + "-preset-editor",
-          style: "display:none;gap:6px;flex-direction:column;margin-top:8px",
-        },
-        [
-          el("div", { style: "display:flex;gap:6px" }, [nameInput, saveBtn]),
-          deleteBtn,
-        ]
-      );
-
-      var LINK_STYLE =
-        "font:11px system-ui;color:#2563eb;text-decoration:none;cursor:pointer";
-      var editorOpen = false;
-      var editLink = el(
-        "a",
-        {
-          href: "#",
-          style: LINK_STYLE,
-          onclick: function (e) {
-            e.preventDefault();
-            editorOpen = !editorOpen;
-            editorBox.style.display = editorOpen ? "flex" : "none";
-            editLink.textContent = editorOpen ? "Hide preset editor" : "Edit Presets";
-          },
-        },
-        ["Edit Presets"]
-      );
-      // Right-aligned twin of Edit Presets: overwrite the selected preset with
-      // what's removed now. Hidden when "No Preset" is selected.
-      var updateLink = el("a", {
-        href: "#",
-        style: LINK_STYLE,
-        onclick: function (e) {
-          e.preventDefault();
-          var p = currentPreset();
-          if (!p) return;
-          var sels = currentSelectors();
-          if (!sels.length) return toast("Nothing removed to save");
-          presetNav(
-            "action=update&id=" + encodeURIComponent(p.id) +
-            "&sels=" + encodeURIComponent(JSON.stringify(sels))
-          );
-        },
-      });
-      function refreshUpdateLink() {
-        var p = currentPreset();
-        if (p) {
-          updateLink.textContent = "Update " + p.name;
-          updateLink.style.display = "";
-        } else {
-          updateLink.style.display = "none";
-        }
-      }
-      var linkRow = el(
-        "div",
-        {
-          style:
-            "display:flex;align-items:center;justify-content:space-between;" +
-            "gap:10px;margin-top:8px",
-        },
-        [editLink, updateLink]
-      );
-
-      rebuildPresetOptions();
-      refreshUpdateLink();
-      // The app calls this (via eval) after a save/update/delete round-trips.
-      window.wwwToPdf.presetsUpdated = function (list) {
-        presets = Array.isArray(list) ? list : [];
-        rebuildPresetOptions();
-        refreshUpdateLink();
-      };
-
-      panel.appendChild(bar);
-      panel.appendChild(removeBtn);
-      panel.appendChild(el("div", { style: "height:6px" }));
-      panel.appendChild(removeRow);
-      panel.appendChild(count);
-      panel.appendChild(divider());
-      panel.appendChild(presetSel);
-      panel.appendChild(linkRow);
-      panel.appendChild(editorBox);
-      panel.appendChild(divider());
-      panel.appendChild(nextBtn);
-      return panel;
-    }
-
-    // font controls
+    // ---- font controls ----
     function slider(label, min, max, val, step, oninput, valfmt) {
       var out = el("span", { style: "font-variant-numeric:tabular-nums;color:#111" }, [
         valfmt(val),
@@ -648,70 +442,30 @@
       return el("div", { style: "display:grid;gap:4px" }, [
         el(
           "div",
-          {
-            style:
-              "display:flex;justify-content:space-between;font-size:11px;color:#52525b",
-          },
+          { style: "display:flex;justify-content:space-between;font-size:11px;color:#52525b" },
           [label, out]
         ),
         input,
       ]);
     }
-    var baseBody = parseInt(
-      getComputedStyle(document.body).fontSize || "16",
-      10
-    ) || 16;
-    var bodySlider = slider(
-      "Body text",
-      12,
-      28,
-      baseBody,
-      1,
-      function (v) {
-        state.bodyPx = parseInt(v, 10);
-        render_style();
-      },
-      function (v) {
-        return v + "px";
-      }
-    );
-    var lineSlider = slider(
-      "Line height",
-      1,
-      2.2,
-      1.6,
-      0.05,
-      function (v) {
-        state.lineHeight = parseFloat(v);
-        render_style();
-      },
-      function (v) {
-        return parseFloat(v).toFixed(2);
-      }
-    );
-    var headSlider = slider(
-      "Heading size",
-      0.6,
-      2,
-      1,
-      0.05,
-      function (v) {
-        state.headingScale = parseFloat(v);
-        render_style();
-      },
-      function (v) {
-        return Math.round(parseFloat(v) * 100) + "%";
-      }
-    );
+    var baseBody = parseInt(getComputedStyle(document.body).fontSize || "16", 10) || 16;
+    var bodySlider = slider("Body text", 12, 28, baseBody, 1, function (v) {
+      state.bodyPx = parseInt(v, 10);
+      render_style();
+    }, function (v) { return v + "px"; });
+    var lineSlider = slider("Line height", 1, 2.2, 1.6, 0.05, function (v) {
+      state.lineHeight = parseFloat(v);
+      render_style();
+    }, function (v) { return parseFloat(v).toFixed(2); });
+    var headSlider = slider("Heading size", 0.6, 2, 1, 0.05, function (v) {
+      state.headingScale = parseFloat(v);
+      render_style();
+    }, function (v) { return Math.round(parseFloat(v) * 100) + "%"; });
 
-    // page & margins (output is US Letter, 8.5 x 11 in)
+    // ---- page & margins (US Letter) ----
     function marginInput(key) {
       return el("input", {
-        type: "number",
-        min: "0",
-        max: "3",
-        step: "0.05",
-        value: state.margins[key],
+        type: "number", min: "0", max: "3", step: "0.05", value: state.margins[key],
         style:
           "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:6px;" +
           "padding:5px 6px;font:12px system-ui",
@@ -724,8 +478,7 @@
     }
     function marginCell(label, key) {
       return el("label", { style: "display:grid;gap:2px;font-size:10px;color:#71717a" }, [
-        label,
-        marginInput(key),
+        label, marginInput(key),
       ]);
     }
     var marginGrid = el(
@@ -758,44 +511,292 @@
       ]
     );
 
-    // save
-    var saveBtn = el(
-      "button",
-      { style: STYLE_PRIMARY, onclick: exportPdf },
-      ["Save as PDF"]
-    );
-    var hint = el(
+    // ---- header / footer / page numbers (stamped by the native renderer) ----
+    function textField(label, key, placeholder) {
+      return el("label", { style: "display:grid;gap:3px;font-size:11px;color:#52525b;margin-top:6px" }, [
+        label,
+        el("input", {
+          type: "text",
+          value: state[key] || "",
+          placeholder: placeholder || "",
+          style:
+            "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:6px;padding:6px 8px;font:12px system-ui",
+          oninput: function (e) { state[key] = e.target.value; },
+        }),
+      ]);
+    }
+    var hfLabel = el(
       "div",
-      { style: "font-size:11px;color:#a1a1aa;text-align:center;margin-top:6px" },
-      ["Choose “Save as PDF” in the print dialog"]
+      { style: "font-size:11px;font-weight:600;color:#52525b" },
+      ["Header & footer"]
+    );
+    var headerField = textField("Header text", "header", "e.g. article title");
+    var footerField = textField("Footer text", "footer", "e.g. source URL");
+    var pageNumToggle = el(
+      "label",
+      { style: "display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:8px;font-size:12px;color:#52525b" },
+      [
+        el("input", {
+          type: "checkbox",
+          onchange: function (e) { state.pageNumbers = e.target.checked; },
+        }),
+        el("span", {}, ["Page numbers"]),
+      ]
     );
 
-    function sep() {
-      return el("div", { style: "height:1px;background:#ececf0;margin:10px 0" });
+    // ============================ WEB (flat, print) ============================
+    if (!isNative) {
+      var saveBtn = el("button", { style: STYLE_PRIMARY, onclick: exportPdf }, ["Save as PDF"]);
+      var hint = el(
+        "div",
+        { style: "font-size:11px;color:#a1a1aa;text-align:center;margin-top:6px" },
+        ["Choose “Save as PDF” in the print dialog"]
+      );
+      panel.appendChild(bar);
+      panel.appendChild(metaToggle);
+      panel.appendChild(metaFields);
+      panel.appendChild(sep());
+      panel.appendChild(removeBtn);
+      panel.appendChild(el("div", { style: "height:6px" }));
+      panel.appendChild(removeRow);
+      panel.appendChild(count);
+      panel.appendChild(sep());
+      panel.appendChild(bodySlider);
+      panel.appendChild(el("div", { style: "height:8px" }));
+      panel.appendChild(lineSlider);
+      panel.appendChild(el("div", { style: "height:8px" }));
+      panel.appendChild(headSlider);
+      panel.appendChild(sep());
+      panel.appendChild(pageLabel);
+      panel.appendChild(marginGrid);
+      panel.appendChild(guideToggle);
+      panel.appendChild(sep());
+      panel.appendChild(saveBtn);
+      panel.appendChild(hint);
+      return panel;
     }
 
+    // ===================== NATIVE (single window, two panes) =====================
+    // Pane 1 (Edit): log in, remove elements, presets. Pane 2 (Format): fonts,
+    // metadata, margins, header/footer, then Preview / Save. The page stays
+    // loaded the whole time; export is a sentinel navigation on this webview.
+    var presetsUI = buildPresets();
+
+    var paneEdit = el("div", { id: NS + "-pane-edit" });
+    var paneFormat = el("div", { id: NS + "-pane-format", style: "display:none" });
+
+    var nextBtn = el("button", { style: STYLE_PRIMARY, onclick: function () {
+      setRemoveMode(false);
+      paneEdit.style.display = "none";
+      paneFormat.style.display = "";
+      panel.scrollTop = 0;
+    } }, ["Next: Format →"]);
+
+    var backLink = el("a", {
+      href: "#",
+      style: "font:11px system-ui;color:#2563eb;text-decoration:none;cursor:pointer",
+      onclick: function (e) {
+        e.preventDefault();
+        paneFormat.style.display = "none";
+        paneEdit.style.display = "";
+        panel.scrollTop = 0;
+      },
+    }, ["← Back to editing"]);
+    var newUrlLink = el("a", {
+      href: "#",
+      style: "font:11px system-ui;color:#71717a;text-decoration:none;cursor:pointer",
+      onclick: function (e) { e.preventDefault(); newUrl(); },
+    }, ["New URL"]);
+
+    var previewBtn = el("button", {
+      style: STYLE_BTN + ";text-align:center", onclick: function () { nativeExport("preview"); },
+    }, ["Preview PDF"]);
+    var saveNativeBtn = el("button", {
+      style: STYLE_PRIMARY, onclick: function () { nativeExport("save"); },
+    }, ["Save PDF"]);
+
+    // Pane 1
+    paneEdit.appendChild(removeBtn);
+    paneEdit.appendChild(el("div", { style: "height:6px" }));
+    paneEdit.appendChild(removeRow);
+    paneEdit.appendChild(count);
+    paneEdit.appendChild(sep());
+    paneEdit.appendChild(presetsUI);
+    paneEdit.appendChild(sep());
+    paneEdit.appendChild(nextBtn);
+
+    // Pane 2
+    paneFormat.appendChild(metaToggle);
+    paneFormat.appendChild(metaFields);
+    paneFormat.appendChild(sep());
+    paneFormat.appendChild(bodySlider);
+    paneFormat.appendChild(el("div", { style: "height:8px" }));
+    paneFormat.appendChild(lineSlider);
+    paneFormat.appendChild(el("div", { style: "height:8px" }));
+    paneFormat.appendChild(headSlider);
+    paneFormat.appendChild(sep());
+    paneFormat.appendChild(pageLabel);
+    paneFormat.appendChild(marginGrid);
+    paneFormat.appendChild(guideToggle);
+    paneFormat.appendChild(sep());
+    paneFormat.appendChild(hfLabel);
+    paneFormat.appendChild(headerField);
+    paneFormat.appendChild(footerField);
+    paneFormat.appendChild(pageNumToggle);
+    paneFormat.appendChild(sep());
+    paneFormat.appendChild(previewBtn);
+    paneFormat.appendChild(el("div", { style: "height:6px" }));
+    paneFormat.appendChild(saveNativeBtn);
+    paneFormat.appendChild(
+      el("div", {
+        style: "display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px",
+      }, [backLink, newUrlLink])
+    );
+
     panel.appendChild(bar);
-    panel.appendChild(metaToggle);
-    panel.appendChild(metaFields);
-    panel.appendChild(sep());
-    panel.appendChild(removeBtn);
-    panel.appendChild(el("div", { style: "height:6px" }));
-    panel.appendChild(removeRow);
-    panel.appendChild(count);
-    panel.appendChild(sep());
-    panel.appendChild(bodySlider);
-    panel.appendChild(el("div", { style: "height:8px" }));
-    panel.appendChild(lineSlider);
-    panel.appendChild(el("div", { style: "height:8px" }));
-    panel.appendChild(headSlider);
-    panel.appendChild(sep());
-    panel.appendChild(pageLabel);
-    panel.appendChild(marginGrid);
-    panel.appendChild(guideToggle);
-    panel.appendChild(sep());
-    panel.appendChild(saveBtn);
-    panel.appendChild(hint);
+    panel.appendChild(paneEdit);
+    panel.appendChild(paneFormat);
     return panel;
+  }
+
+  // Presets section (native only). Returns a container element.
+  function buildPresets() {
+    var box = el("div");
+    var presets = Array.isArray(window.__WWWPDF_PRESETS) ? window.__WWWPDF_PRESETS : [];
+    var hostKey = function (h) { return (h || "").replace(/^www\./, ""); };
+    var NO_PRESET = "";
+
+    var presetSel = el("select", {
+      id: NS + "-preset-sel",
+      style:
+        "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:7px;" +
+        "padding:7px 8px;font:12px system-ui;background:#fff;color:#18181b",
+      onchange: function () {
+        refreshUpdateLink();
+        var p = currentPreset();
+        if (p) applyPreset(p);
+      },
+    });
+    function sortedPresets() {
+      var here = hostKey(location.hostname);
+      return presets.slice().sort(function (a, b) {
+        var am = hostKey(a.host) === here ? 0 : 1;
+        var bm = hostKey(b.host) === here ? 0 : 1;
+        if (am !== bm) return am - bm;
+        return a.name < b.name ? -1 : 1;
+      });
+    }
+    function rebuildPresetOptions() {
+      var keep = presetSel.value;
+      presetSel.textContent = "";
+      var here = hostKey(location.hostname);
+      var none = document.createElement("option");
+      none.value = NO_PRESET;
+      none.textContent = "No Preset";
+      presetSel.appendChild(none);
+      sortedPresets().forEach(function (p) {
+        var o = document.createElement("option");
+        o.value = p.id;
+        o.textContent = (hostKey(p.host) === here ? "★ " : "") + p.name;
+        presetSel.appendChild(o);
+      });
+      presetSel.value = presets.some(function (p) { return p.id === keep; }) ? keep : NO_PRESET;
+    }
+    function currentPreset() {
+      var id = presetSel.value;
+      for (var i = 0; i < presets.length; i++) if (presets[i].id === id) return presets[i];
+      return null;
+    }
+    function currentSelectors() {
+      var sels = [];
+      state.removed.forEach(function (r) {
+        if (r.sel && sels.indexOf(r.sel) < 0) sels.push(r.sel);
+      });
+      return sels;
+    }
+    function presetNav(params) {
+      window.location.href = "https://" + PRESET_HOST + "/?" + params;
+    }
+
+    var nameInput = el("input", {
+      type: "text", placeholder: "New preset name", value: hostKey(location.hostname),
+      style:
+        "width:100%;box-sizing:border-box;border:1px solid #d4d4d8;border-radius:7px;" +
+        "padding:7px 8px;font:12px system-ui",
+    });
+    var saveBtn = el("button", {
+      style: STYLE_BTN + ";width:auto;flex:none;text-align:center",
+      onclick: function () {
+        var sels = currentSelectors();
+        if (!sels.length) return toast("Click some elements to remove first");
+        var name = (nameInput.value || "").trim() || hostKey(location.hostname);
+        presetNav(
+          "action=save&name=" + encodeURIComponent(name) +
+          "&host=" + encodeURIComponent(location.hostname) +
+          "&sels=" + encodeURIComponent(JSON.stringify(sels))
+        );
+      },
+    }, ["Save new"]);
+    var deleteBtn = el("button", {
+      style: STYLE_BTN + ";text-align:center;color:#dc2626",
+      onclick: function () {
+        var p = currentPreset();
+        if (!p) return toast("Select a preset to delete");
+        presetNav("action=delete&id=" + encodeURIComponent(p.id));
+      },
+    }, ["Delete selected"]);
+    var editorBox = el("div", {
+      id: NS + "-preset-editor",
+      style: "display:none;gap:6px;flex-direction:column;margin-top:8px",
+    }, [
+      el("div", { style: "display:flex;gap:6px" }, [nameInput, saveBtn]),
+      deleteBtn,
+    ]);
+
+    var LINK_STYLE = "font:11px system-ui;color:#2563eb;text-decoration:none;cursor:pointer";
+    var editorOpen = false;
+    var editLink = el("a", {
+      href: "#", style: LINK_STYLE,
+      onclick: function (e) {
+        e.preventDefault();
+        editorOpen = !editorOpen;
+        editorBox.style.display = editorOpen ? "flex" : "none";
+        editLink.textContent = editorOpen ? "Hide preset editor" : "Edit Presets";
+      },
+    }, ["Edit Presets"]);
+    var updateLink = el("a", {
+      href: "#", style: LINK_STYLE,
+      onclick: function (e) {
+        e.preventDefault();
+        var p = currentPreset();
+        if (!p) return;
+        var sels = currentSelectors();
+        if (!sels.length) return toast("Nothing removed to save");
+        presetNav("action=update&id=" + encodeURIComponent(p.id) +
+          "&sels=" + encodeURIComponent(JSON.stringify(sels)));
+      },
+    });
+    function refreshUpdateLink() {
+      var p = currentPreset();
+      if (p) { updateLink.textContent = "Update " + p.name; updateLink.style.display = ""; }
+      else { updateLink.style.display = "none"; }
+    }
+    var linkRow = el("div", {
+      style: "display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px",
+    }, [editLink, updateLink]);
+
+    rebuildPresetOptions();
+    refreshUpdateLink();
+    window.wwwToPdf.presetsUpdated = function (list) {
+      presets = Array.isArray(list) ? list : [];
+      rebuildPresetOptions();
+      refreshUpdateLink();
+    };
+
+    box.appendChild(presetSel);
+    box.appendChild(linkRow);
+    box.appendChild(editorBox);
+    return box;
   }
 
   function makeDraggable(panel, handle) {
@@ -823,46 +824,39 @@
     });
   }
 
-  // ---- stage hand-off / export ---------------------------------------------
-  // Sentinel host used to signal the native app that stage 2 (DOM editing) is
-  // done. The Rust `on_navigation` handler recognises it, cancels the
-  // navigation (the page is untouched), and opens the PDF-settings window.
-  // Sentinel navigation avoids the Tauri IPC ACL entirely, which is unreliable
-  // for dynamically-created remote webviews.
-  var STAGE3_HOST = "wwwtopdf.stage3";
-  // Preset save/delete travels the same way (query carries the payload); the
-  // app intercepts, persists to disk, and calls presetsUpdated back via eval.
+  // ---- export / navigation (native single-window) --------------------------
+  // Everything native travels over sentinel navigations: the remote page has
+  // no working Tauri IPC, but a navigation the Rust `on_navigation` hook can
+  // cancel (leaving the page untouched) is a reliable one-way channel.
+  //   wwwtopdf.export?action=save|preview&…  -> render this webview to a PDF
+  //   wwwtopdf.home                          -> go back to URL entry
+  //   wwwtopdf.preset?action=…               -> persist a preset
+  var EXPORT_HOST = "wwwtopdf.export";
+  var HOME_HOST = "wwwtopdf.home";
   var PRESET_HOST = "wwwtopdf.preset";
 
-  function gotoStage3() {
-    setRemoveMode(false);
+  // Fonts/metadata already live in the page DOM (createPDF captures them);
+  // only margins + header/footer/page-numbers + filename need to reach Rust.
+  function nativeExport(action) {
+    var m = state.margins;
     var q =
-      "title=" + encodeURIComponent(document.title || "") +
-      "&url=" + encodeURIComponent(state.meta.url || location.href);
-    window.location.href = "https://" + STAGE3_HOST + "/?" + q;
+      "action=" + action +
+      "&title=" + encodeURIComponent(state.meta.title || document.title || "") +
+      "&mt=" + m.top + "&mr=" + m.right + "&mb=" + m.bottom + "&ml=" + m.left +
+      "&header=" + encodeURIComponent(state.header || "") +
+      "&footer=" + encodeURIComponent(state.footer || "") +
+      "&pagenum=" + (state.pageNumbers ? "1" : "0");
+    toast(action === "preview" ? "Rendering preview…" : "Rendering PDF…");
+    setTimeout(function () {
+      window.location.href = "https://" + EXPORT_HOST + "/?" + q;
+    }, 30);
   }
-
-  // Applied by the PDF-settings window (via native eval) — fonts and metadata
-  // must live in the page's own DOM so they show up in the rendered PDF.
-  function applySettings(s) {
-    if (!s) return;
-    if (typeof s.bodyPx === "number") state.bodyPx = s.bodyPx;
-    else if (s.bodyPx === null) state.bodyPx = null;
-    if (typeof s.lineHeight === "number") state.lineHeight = s.lineHeight;
-    else if (s.lineHeight === null) state.lineHeight = null;
-    if (typeof s.headingScale === "number") state.headingScale = s.headingScale;
-    if (s.margins) {
-      ["top", "right", "bottom", "left"].forEach(function (k) {
-        if (typeof s.margins[k] === "number") state.margins[k] = s.margins[k];
-      });
-    }
-    if (s.meta) {
-      Object.keys(s.meta).forEach(function (k) {
-        state.meta[k] = s.meta[k];
-      });
-    }
-    render_style();
-    renderMeta();
+  function newUrl() {
+    window.location.href = "https://" + HOME_HOST + "/";
+  }
+  // Called by Rust (via eval) after a render completes.
+  function afterExport(ok, message) {
+    toast((ok ? "" : "PDF failed: ") + message);
   }
 
   function exportPdf() {
@@ -941,12 +935,17 @@
   window.wwwToPdf.unmount = unmount;
   window.wwwToPdf.state = state;
   window.wwwToPdf.toast = toast; // native side calls this for progress/errors
-  window.wwwToPdf.applySettings = applySettings;
+  window.wwwToPdf.afterExport = afterExport; // native side reports render result
 
-  if (!window.__WWWTOPDF_NO_AUTOMOUNT) {
+  // The single native webview also shows our own app UI (the URL-entry page),
+  // which sets __WWWPDF_IS_APP. Don't mount the editor there.
+  function shouldAutoMount() {
+    return !window.__WWWTOPDF_NO_AUTOMOUNT && !window.__WWWPDF_IS_APP;
+  }
+  if (shouldAutoMount()) {
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", function () {
-        mount();
+        if (shouldAutoMount()) mount();
       });
     } else {
       mount();
