@@ -2,21 +2,23 @@
 
 Capture a website, tidy it up, and save it as a clean PDF.
 
-The native app is a four-stage flow:
+The native app is a **single window** (so it works on iOS, which forbids
+multiple windows) with an in-page toolbar that progresses through panes:
 
-1. **URL entry** — type or pick from your recent links (shown with page title).
-2. **Page editing** — the site opens in a real webview: log in if needed, then
-   click elements to remove clutter (nav bars, cookie banners, ads…). Removal
-   sets can be saved as **presets** and re-applied on later visits — or on
-   other sites with the same layout (e.g. any Substack).
-3. **PDF settings** — a second window shows a live preview that is the *actual
-   generated PDF*, with controls for body size, line height, heading scale,
-   per-side margins (US Letter output), a sans-serif metadata header (title,
-   URL, author, access date, notes), and header/footer text with optional
-   page numbers.
-4. **Save** — a native save dialog on desktop; the share sheet on iOS.
+1. **URL entry** — type or pick from your recent links. The one webview then
+   navigates to the site in place.
+2. **Edit** — log in if needed, then click elements to remove clutter (nav
+   bars, cookie banners, ads…). Removal sets save as **presets**, re-applied on
+   later visits or on other sites with the same layout (e.g. any Substack).
+3. **Format** — "Next" flips the toolbar to formatting: body size, line height,
+   heading scale, per-side margins (US Letter), a sans-serif metadata header
+   (title, URL, author, access date, notes), and header/footer with optional
+   page numbers — all applied live to the page.
+4. **Preview / Save** — Preview renders the real PDF and opens it in the OS
+   viewer (share sheet on iOS); Save writes it (save dialog on desktop, share
+   sheet on iOS). "New URL" returns to step 1.
 
-It ships as a **web app** (GitHub Pages) and a **native app** (Tauri 2, desktop + iOS/Android).
+It ships as a **web app** (GitHub Pages) and a **native app** (Tauri 2, desktop + iOS).
 
 ---
 
@@ -48,22 +50,28 @@ The web (GitHub Pages) build works for same-origin and framable pages. Anything
 that blocks framing or needs a login can only be captured in the **native app**,
 whose webview has no cross-origin limit — that's the app's reason to exist.
 
-### How the native staged flow hangs together
+### How the single-window native flow hangs together
 
 Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
 
-- **Stage 2 → 3 hand-off:** app-command IPC from a dynamically-created *remote*
-  webview is denied by Tauri's ACL
-  ([#10317](https://github.com/tauri-apps/tauri/issues/10317)), so the injected
-  toolbar's "Next" navigates to a sentinel URL (`https://wwwtopdf.stage3/?…`);
-  Rust's `on_navigation` hook cancels the navigation (the edited page is
-  untouched) and opens the PDF-settings window.
-- **Stage 3 preview:** the settings window is *local* UI, so it uses normal
-  IPC. Each change is `eval`'d into the target page (fonts/metadata must live
-  in the page DOM to appear in the render), then the page is rendered to a
-  temp PDF shown via the asset protocol. What you see is the real paginated
-  PDF.
-- **Rendering = createPDF + Rust pagination.** WKWebView's
+- **One webview.** iOS forbids multiple windows, so there is a single window
+  (created in `run()`'s `setup`) that starts on the bundled URL-entry page and
+  navigates to target sites *in place* (`load_url`). The editor engine is an
+  init script that runs on every page and mounts its toolbar on remote pages
+  (it suppresses itself on our own page via `__WWWPDF_IS_APP`).
+- **Sentinel navigations, not IPC.** A remote page has no working Tauri IPC
+  (ACL, [#10317](https://github.com/tauri-apps/tauri/issues/10317)), so the
+  toolbar signals the app by navigating to a sentinel host the `on_navigation`
+  hook cancels: `wwwtopdf.export?action=save|preview&…` (render), `wwwtopdf.home`
+  (back to URL entry), `wwwtopdf.preset?action=…` (persist). Fonts/metadata are
+  applied directly to the page DOM (so `createPDF` captures them); only margins,
+  header/footer, page-numbers and the filename ride the export sentinel.
+- **Preview vs. save.** A strict site CSP can block an embedded PDF, so there's
+  no in-page preview pane; instead "Preview" renders the real PDF and opens it
+  in the OS viewer (Quick Look on macOS, share sheet on iOS), and "Save" writes
+  it (save dialog on desktop, share sheet on iOS). Rendering on demand also
+  avoids re-rendering on every keystroke.
+- **Rendering = createPDF + Rust pagination** (shared by macOS and iOS). WKWebView's
   `printOperationWithPrintInfo:` derives its layout width and scale from the
   *printer's* imageable bounds (constant for save-to-PDF) while clipping to
   the user margins — so custom margins structurally cannot work there
@@ -98,9 +106,11 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   with an injected `@page { size: 8.5in 11in; margin: … }` — the print dialog
   is the preview. Works in real browsers, including iPad Safari.
 
-> **Rendering is macOS-only for now** — the iOS renderer (via
-> `UIPrintPageRenderer`) is a TODO; the share-sheet plumbing is already in
-> place. The app otherwise runs on iOS.
+> The renderer is shared by macOS and iOS: `createPDF`, `evaluateJavaScript`,
+> and `frame`/`setFrame:` all exist on both `NSView` and `UIView`, so the same
+> `render_pdf` runs on both (the paginator/stamper is pure Rust). iOS save/
+> preview go through the share sheet. **Not yet exercised on a device** — see
+> the iOS testing notes below.
 
 ---
 
@@ -166,21 +176,15 @@ generated `src-tauri/gen/apple/` is git-ignored by default (regenerate with
 (Info.plist entries, signing). Device builds need a development team — set it
 in Xcode (`gen/apple`) or as `bundle.iOS.developmentTeam` in `tauri.conf.json`.
 
-> **iOS status — builds and launches, but the flow isn't wired for mobile yet.**
-> Two things are macOS-shaped in the current code:
-> 1. **Multi-window.** The desktop flow opens separate *target* and *preview*
->    windows; Tauri mobile is single-window, so `open_target` won't create a
->    window on iOS. You'll reach the URL-entry screen, but loading a page needs
->    a single-window mobile flow (target page + settings as an in-page overlay,
->    reusing the existing sentinel-navigation channel).
-> 2. **Renderer.** `render_pdf` is macOS-only (createPDF + AppKit frame control);
->    iOS needs the `UIView`/`UIScrollView` equivalent. The share-sheet export
->    (`UIActivityViewController`) is already written and will compile now that
->    `objc2` targets iOS.
->
-> So `build:ios` is useful today for confirming the toolchain, signing, and
-> that the Rust (including the iOS share-sheet code) compiles for the iOS
-> targets — the groundwork for making the flow functional there.
+> **iOS status — architected for it, not yet verified on a device.** Both
+> former blockers are addressed: the app is now single-window (a pane
+> progression, no `target`/`preview` windows), and the renderer is shared by
+> macOS and iOS. What remains is on-device reality-checking, since none of the
+> Apple code can be compiled off a Mac. Likely first things to shake out:
+> whether `setFrame:` on the iOS `WKWebView` sticks (it may fight the view
+> controller's layout), the share sheet's popover anchoring on iPad, and the
+> file paths (`$TEMP`) matching the asset-protocol scope. Paste any build or
+> runtime error and it's usually a small fix.
 
 ## Layout
 
