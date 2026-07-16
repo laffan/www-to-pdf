@@ -24,6 +24,16 @@ tokio = { version = "1", features = ["sync", "time"] }
 tauri-plugin-dialog = "2"
 # Header/footer/page-number stamping onto rendered PDFs (pure Rust).
 lopdf = "0.43"
+# Bushido-style ad blocking: Brave's adblock engine (cosmetic filtering over
+# EasyList). Default features minus `single-thread`, so the engine is
+# Send + Sync and can live in Tauri managed state.
+adblock = { version = "0.13", default-features = false, features = [
+  "embedded-domain-resolver",
+  "full-regex-handling",
+  "css-validation",
+] }
+# Fetches EasyList at runtime (cached in the app data dir).
+ureq = "3"
 
 # Apple message sends + completion-handler blocks: the createPDF render
 # pipeline (frame control, evaluateJavaScript, createPDF) is shared by macOS

@@ -18,6 +18,8 @@
 use std::sync::Mutex;
 use tauri::{Manager, Url, WebviewUrl, WebviewWindowBuilder};
 
+mod bushido;
+
 // The shared editor engine, embedded so the native build is self-contained.
 const EDITOR_JS: &str = include_str!("../../public/editor.js");
 
@@ -37,6 +39,7 @@ const EXPORT_HOST: &str = "wwwtopdf.export"; // ?action=save|preview&margins…
 const HOME_HOST: &str = "wwwtopdf.home"; // back to URL entry
 const PRESET_HOST: &str = "wwwtopdf.preset"; // ?action=save|update|delete…
 const LOAD_HOST: &str = "wwwtopdf.load"; // ?url=… -> native WKWebView load
+const ADBLOCK_HOST: &str = "wwwtopdf.adblock"; // ?action=refresh -> recompute ad filters
 
 /// A saved removal set: CSS selectors recorded when elements were clicked,
 /// replayable on any page with similar markup. Stored in the app data dir;
@@ -162,6 +165,10 @@ struct AppState {
     // recent list when it next loads (the target page is a different origin, so
     // it can't write the app's localStorage itself).
     titles: Mutex<std::collections::HashMap<String, String>>,
+    // The Bushido-style ad-block engine. Built once, in the background, at app
+    // start (EasyList parse takes a beat); None until then and when the list
+    // can neither be read from cache nor downloaded.
+    adblock: Mutex<Option<bushido::AdBlocker>>,
 }
 
 struct Margins {
@@ -222,6 +229,14 @@ fn handle_sentinel(app: &tauri::AppHandle, nav_url: &Url) -> bool {
             let app = app.clone();
             let url = nav_url.clone();
             tauri::async_runtime::spawn(async move { handle_preset_nav(&app, &url) });
+            true
+        }
+        Some(ADBLOCK_HOST) => {
+            // "↻ Refresh filters": recompute the cosmetic filter set for the
+            // page as it is NOW (late-loading ads bring classes/ids the first
+            // harvest missed).
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move { push_adblock_selectors(&app).await });
             true
         }
         Some(LOAD_HOST) => {
@@ -295,6 +310,74 @@ fn capture_history_title(app: &tauri::AppHandle) {
 }
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn capture_history_title(_app: &tauri::AppHandle) {}
+
+// ---- Bushido ad blocking: per-page cosmetic filters -------------------------
+// Generic EasyList rules are keyed to class names / ids, so the page is asked
+// what it actually contains (like uBlock's cosmetic survey); the engine then
+// returns only the selectors that matter here. Capped so a pathological page
+// can't produce an unbounded payload.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const ADBLOCK_HARVEST_JS: &str = r#"(function(){
+  try{
+    var cs={},ids={},els=document.querySelectorAll('[class],[id]');
+    for(var i=0;i<els.length&&i<20000;i++){var e=els[i];
+      if(e.id)ids[e.id]=1;
+      var cl=e.classList;if(cl)for(var j=0;j<cl.length;j++)cs[cl[j]]=1;}
+    return JSON.stringify({c:Object.keys(cs).slice(0,8000),i:Object.keys(ids).slice(0,8000)});
+  }catch(err){return '{"c":[],"i":[]}'}
+})()"#;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[derive(serde::Deserialize, Default)]
+struct Harvest {
+    #[serde(default)]
+    c: Vec<String>,
+    #[serde(default)]
+    i: Vec<String>,
+}
+
+/// Compute the hide-selector set for the currently loaded page and hand it to
+/// the in-page editor (which owns the on/off toggle and the actual hiding).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+async fn push_adblock_selectors(app: &tauri::AppHandle) {
+    let Some(webview) = app.get_webview_window("main") else {
+        return;
+    };
+    let url = eval_js_string(&webview, "location.href")
+        .await
+        .unwrap_or_default();
+    if !url.starts_with("http") {
+        return; // our own app page, or nothing loaded yet
+    }
+    let harvest: Harvest = eval_js_string(&webview, ADBLOCK_HARVEST_JS)
+        .await
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let state = app.state::<AppState>();
+    let selectors = {
+        let guard = state.adblock.lock().unwrap();
+        let Some(blocker) = guard.as_ref() else {
+            return; // engine still building, or no list available
+        };
+        blocker.selectors_for(&url, &harvest.c, &harvest.i)
+    };
+    if selectors.is_empty() {
+        return; // keep the editor's built-in fallback
+    }
+    let Ok(json) = serde_json::to_string(&selectors) else {
+        return;
+    };
+    let json = json.replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029");
+    // Stash on the window as well: if the push wins the race with the editor's
+    // mount, mount picks it up from there.
+    let _ = webview.eval(&format!(
+        "window.__WWWPDF_ADBLOCK={json};window.wwwToPdf&&window.wwwToPdf.setAdblockSelectors&&window.wwwToPdf.setAdblockSelectors(window.__WWWPDF_ADBLOCK)"
+    ));
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+async fn push_adblock_selectors(_app: &tauri::AppHandle) {}
 
 /// Render the current webview to the preview PDF, then save or preview it.
 async fn do_export(app: tauri::AppHandle, url: Url) {
@@ -787,6 +870,10 @@ struct Meas {
 /// line's top leading) so descenders that overpaint the box edge survive.
 const CAPTURE_PREP_JS: &str = r#"(function(){
   try{
+    // Freeze the page's own JS first (idempotent): re-assert every removal,
+    // cancel pending timers/animation frames, and stub the scheduling APIs so
+    // ad scripts can't re-inject anything between here and createPDF.
+    if(window.wwwToPdf&&window.wwwToPdf.__captureFreeze)window.wwwToPdf.__captureFreeze();
     var st=document.getElementById('wwwpdf-capture');
     if(!st){st=document.createElement('style');st.id='wwwpdf-capture';
       // Hide ALL of the tool's own chrome so createPDF captures only the page.
@@ -829,9 +916,10 @@ const CAPTURE_PREP_JS: &str = r#"(function(){
   }catch(err){return JSON.stringify({h:0,w:0,b:[]})}
 })()"#;
 
-/// Undo CAPTURE_PREP_JS (safe to run repeatedly).
+/// Undo CAPTURE_PREP_JS (safe to run repeatedly): drop the capture style and
+/// give the page its real scheduling APIs back.
 const CAPTURE_DONE_JS: &str =
-    "(function(){var s=document.getElementById('wwwpdf-capture');if(s)s.remove();})()";
+    "(function(){var s=document.getElementById('wwwpdf-capture');if(s)s.remove();if(window.wwwToPdf&&window.wwwToPdf.__captureThaw)window.wwwToPdf.__captureThaw();})()";
 
 /// Set the WKWebView frame size (width and/or height); returns the previous
 /// size. wry attaches the webview with an autoresizing mask, not Auto Layout
@@ -1031,6 +1119,13 @@ async fn render_pdf(
     let printable_w_px = ((8.5 - p.left - p.right).max(1.0)) * PX_PER_IN;
     let raw_path = std::env::temp_dir().join("wwwtopdf-raw.pdf");
     let raw_str = raw_path.to_string_lossy().into_owned();
+
+    // 0. Freeze the page's JS BEFORE the reflow below: ad slots treat the
+    //    resize as a viewport change and refresh into it, resurrecting
+    //    containers the user removed. CAPTURE_PREP_JS freezes again
+    //    (idempotently) as a belt-and-braces; CAPTURE_DONE_JS thaws.
+    let _ = webview
+        .eval("window.wwwToPdf&&window.wwwToPdf.__captureFreeze&&window.wwwToPdf.__captureFreeze()");
 
     // 1. Reflow to print width (remember the original frame).
     let (old_w, old_h) = set_webview_frame(webview, Some(printable_w_px), None).await?;
@@ -1232,6 +1327,20 @@ pub fn run() {
                 presets_json_for_js(&load_presets(&handle)),
                 EDITOR_JS
             );
+            // Build the Bushido ad-block engine in the background — the
+            // EasyList fetch/parse takes a beat and must not block the window.
+            // Pages loaded before it's ready fall back to the editor's
+            // built-in selector list until the next load or filter refresh.
+            {
+                let h = handle.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let dir = h.path().app_data_dir().ok();
+                    match bushido::AdBlocker::init(dir.as_deref()) {
+                        Ok(b) => *h.state::<AppState>().adblock.lock().unwrap() = Some(b),
+                        Err(e) => eprintln!("www-to-pdf: ad-block engine unavailable: {e}"),
+                    }
+                });
+            }
             let nav_handle = handle.clone();
             let load_handle = handle.clone();
             // `mut` is only used on desktop (inner_size below); mobile keeps it as-is.
@@ -1273,6 +1382,19 @@ pub fn run() {
                         } else {
                             // A target site finished loading: record its title.
                             capture_history_title(&load_handle);
+                            // Push the page's ad filters: once right away, and
+                            // again after late ad scripts have added the
+                            // classes/ids the first harvest couldn't see.
+                            let h = load_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                for delay_ms in [300u64, 2500] {
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        delay_ms,
+                                    ))
+                                    .await;
+                                    push_adblock_selectors(&h).await;
+                                }
+                            });
                         }
                     });
             // Desktop gets an initial + minimum window size. On mobile the window

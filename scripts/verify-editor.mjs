@@ -555,6 +555,234 @@ await appPage.close();
   await wide.close();
 }
 
+// 19. Removal enforcement: removals survive the page's own JS. Ad-heavy sites
+// resurrect "removed" elements two ways — rewriting className (wiping our
+// class) and replacing the node wholesale (fresh element, no class). Both
+// must be re-asserted before the next paint.
+{
+  const p = await browser.newPage();
+  await p.setContent(SAMPLE, { waitUntil: "load" });
+  await p.addScriptTag({ content: EDITOR });
+  await p.evaluate(() => { window.wwwToPdf.state.removeMode = true; });
+  await p.click("#nav");
+  await p.evaluate(() => { window.wwwToPdf.state.removeMode = false; });
+  // (a) the site wipes the class attribute
+  await p.evaluate(() => { document.getElementById("nav").className = "site-nav"; });
+  check("enforcement: class wipe is re-asserted", await p.evaluate(() => {
+    const nav = document.getElementById("nav");
+    return nav.classList.contains("wwwpdf-removed") &&
+      getComputedStyle(nav).display === "none";
+  }));
+  // (b) the site replaces the node wholesale (framework re-render / ad refresh)
+  await p.evaluate(() => {
+    const old = document.getElementById("nav");
+    const fresh = document.createElement("nav");
+    fresh.id = "nav";
+    fresh.textContent = "RESURRECTED AD";
+    old.replaceWith(fresh);
+  });
+  check("enforcement: replaced node is re-removed via its selector", await p.evaluate(() => {
+    const nav = document.getElementById("nav");
+    return getComputedStyle(nav).display === "none" &&
+      document.getElementById("wwwpdf-count").textContent === "1 removed";
+  }));
+  // (c) the site tears out our style element
+  await p.evaluate(() => { document.getElementById("wwwpdf-style").remove(); });
+  await p.evaluate(() => {
+    document.body.appendChild(document.createElement("div")); // any mutation
+  });
+  check("enforcement: style element is re-created if the page removes it", await p.evaluate(() =>
+    !!document.getElementById("wwwpdf-style") &&
+    getComputedStyle(document.getElementById("nav")).display === "none"
+  ));
+  // (d) undo is intentional un-hiding — the enforcer must NOT fight it
+  await p.evaluate(() => {
+    [...document.querySelectorAll("#wwwpdf-panel button")]
+      .find((b) => b.textContent === "Undo").click();
+  });
+  await p.evaluate(() => {
+    document.body.appendChild(document.createElement("div")); // any mutation
+  });
+  check("enforcement: undo sticks (no re-remove after undo)", await p.evaluate(() =>
+    getComputedStyle(document.getElementById("nav")).display !== "none"
+  ));
+  await p.close();
+}
+
+// 20. Capture freeze: no page JS may run between removing elements and the
+// PDF capture. Pending timers are cancelled, new scheduling is inert, and
+// anything that still mutates the DOM is caught by the enforcement observer.
+// Thaw restores the real APIs.
+{
+  const p = await browser.newPage();
+  await p.setContent(SAMPLE, { waitUntil: "load" });
+  await p.addScriptTag({ content: EDITOR });
+  await p.evaluate(() => { window.wwwToPdf.state.removeMode = true; });
+  await p.click("#nav");
+  await p.evaluate(() => { window.wwwToPdf.state.removeMode = false; });
+  await p.evaluate(() => {
+    // An "ad script" already scheduled before the freeze…
+    window.__reinjected = false;
+    setTimeout(() => { window.__reinjected = true; }, 100);
+    window.wwwToPdf.__captureFreeze();
+  });
+  await p.waitForTimeout(300);
+  check("freeze cancels timers the page had pending", await p.evaluate(() =>
+    window.__reinjected === false
+  ));
+  check("freeze makes new setTimeout/rAF inert", await p.evaluate(() => {
+    window.__late = false;
+    const id = setTimeout(() => { window.__late = true; }, 0);
+    requestAnimationFrame(() => { window.__late = true; });
+    return id >= 1000000000;
+  }));
+  await p.waitForTimeout(150);
+  check("…and their callbacks never fire", await p.evaluate(() => window.__late === false));
+  // DOM mutation during the freeze (e.g. a fetch handler already in flight)
+  // is still corrected by the enforcement observer before any paint.
+  await p.evaluate(() => {
+    const old = document.getElementById("nav");
+    const fresh = document.createElement("nav");
+    fresh.id = "nav";
+    old.replaceWith(fresh);
+  });
+  check("mutations during the freeze are still re-removed", await p.evaluate(() =>
+    getComputedStyle(document.getElementById("nav")).display === "none"
+  ));
+  await p.evaluate(() => { window.wwwToPdf.__captureThaw(); });
+  await p.evaluate(() => {
+    window.__thawed = false;
+    setTimeout(() => { window.__thawed = true; }, 10);
+  });
+  await p.waitForTimeout(120);
+  check("thaw restores real timers", await p.evaluate(() => window.__thawed === true));
+  await p.close();
+}
+
+// 20b. The native capture scripts drive the freeze: prep freezes before
+// createPDF, done thaws after (extracted from lib.rs, run for real).
+{
+  const librs = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const prep = librs.match(/CAPTURE_PREP_JS: &str = r#"([\s\S]*?)"#;/);
+  const done = librs.match(/CAPTURE_DONE_JS: &str =\s*"([\s\S]*?)";/);
+  check("capture-prep freezes page JS, capture-done thaws",
+    !!prep && !!done &&
+    prep[1].includes("__captureFreeze") && done[1].includes("__captureThaw"));
+  if (prep && done) {
+    const p = await browser.newPage();
+    await p.setContent(SAMPLE, { waitUntil: "load" });
+    await p.addScriptTag({ content: EDITOR });
+    await p.evaluate((js) => window.eval(js), prep[1]);
+    check("running capture-prep engages the freeze", await p.evaluate(() => {
+      const id = setTimeout(() => {}, 0);
+      return id >= 1000000000;
+    }));
+    await p.evaluate((js) => window.eval(js), done[1]);
+    check("running capture-done releases the freeze", await p.evaluate(() => {
+      const id = setTimeout(() => {}, 0);
+      return id < 1000000000;
+    }));
+    await p.close();
+  }
+}
+
+// 21. Bushido ad blocking, web/fallback path: the built-in selector list hides
+// unambiguous ad containers on mount; the toggle works; a selector set pushed
+// by the native engine replaces the fallback.
+const AD_SAMPLE = `<!doctype html><html><head><title>Ads</title></head><body>
+  <h1>Article</h1>
+  <p id="content">Real content stays.</p>
+  <div class="adsbygoogle" id="ad1">AD 1</div>
+  <div id="div-gpt-ad-123-0" >AD 2</div>
+  <div class="ad-banner" id="ad3">AD 3</div>
+  <div id="custom-ad">engine-flagged ad</div>
+</body></html>`;
+{
+  const p = await browser.newPage();
+  await p.setContent(AD_SAMPLE, { waitUntil: "load" });
+  await p.addScriptTag({ content: EDITOR });
+  const hidden = (id) => p.evaluate(
+    (i) => getComputedStyle(document.getElementById(i)).display === "none", id);
+  check("built-in filters hide ad containers on mount",
+    (await hidden("ad1")) && (await hidden("div-gpt-ad-123-0")) && (await hidden("ad3")));
+  check("…but not the content (or unknown ids)",
+    !(await hidden("content")) && !(await hidden("custom-ad")));
+  check("Block ads checkbox is on; status names the built-in list", await p.evaluate(() => {
+    const status = document.getElementById("wwwpdf-adcount");
+    const cb = status && [...document.querySelectorAll("#wwwpdf-panel label")]
+      .find((l) => l.textContent.includes("Block ads"))?.querySelector("input");
+    return !!cb && cb.checked && /built-in/.test(status.textContent) &&
+      /3 hidden/.test(status.textContent);
+  }));
+  // An ad injected AFTER the filters applied is dead on arrival (CSS rule).
+  await p.evaluate(() => {
+    const late = document.createElement("div");
+    late.className = "adsbygoogle";
+    late.id = "late-ad";
+    document.body.appendChild(late);
+  });
+  check("late-injected ad is hidden on arrival", await hidden("late-ad"));
+  // Toggle off -> ads return; engine pushes respect the explicit opt-out.
+  const toggle = () => p.evaluate(() => {
+    [...document.querySelectorAll("#wwwpdf-panel label")]
+      .find((l) => l.textContent.includes("Block ads")).querySelector("input").click();
+  });
+  await toggle();
+  check("toggle off restores the ad containers", !(await hidden("ad1")));
+  await p.evaluate(() => window.wwwToPdf.setAdblockSelectors(["#custom-ad", "bad[[selector"]));
+  check("engine push while opted out stays off", !(await hidden("custom-ad")));
+  await toggle();
+  check("toggle back on applies the ENGINE set (replaces built-ins, skips bad selectors)",
+    (await hidden("custom-ad")) && !(await hidden("ad1")) && await p.evaluate(() =>
+      /EasyList/.test(document.getElementById("wwwpdf-adcount").textContent)));
+  await p.close();
+}
+
+// 22. Bushido ad blocking, native path: Rust may stash the engine's selector
+// set before the editor mounts; the Edit pane hosts the controls; "Refresh
+// filters" asks Rust to recompute via the wwwtopdf.adblock sentinel.
+{
+  const p = await browser.newPage();
+  let adblockNavUrl = null;
+  await p.route("https://wwwtopdf.adblock/**", (route) => {
+    adblockNavUrl = route.request().url();
+    route.abort("aborted");
+  });
+  await p.route("https://wwwtopdf.export/**", (route) => route.abort("aborted"));
+  await p.setContent(AD_SAMPLE, { waitUntil: "load" });
+  await p.evaluate(() => {
+    window.__TAURI_INTERNALS__ = {};
+    window.__WWWPDF_PRESETS = [];
+    window.__WWWPDF_ADBLOCK = ["#custom-ad"]; // pushed by Rust pre-mount
+  });
+  await p.addScriptTag({ content: EDITOR });
+  check("pre-mount engine push wins over the built-in list", await p.evaluate(() =>
+    getComputedStyle(document.getElementById("custom-ad")).display === "none" &&
+    getComputedStyle(document.getElementById("ad1")).display !== "none" &&
+    /EasyList/.test(document.getElementById("wwwpdf-adcount").textContent)
+  ));
+  check("ad-block controls live in the Edit pane", await p.evaluate(() =>
+    !!document.getElementById("wwwpdf-pane-edit")
+      .querySelector("#wwwpdf-adcount")
+  ));
+  await p.evaluate(() => {
+    [...document.querySelectorAll("#wwwpdf-panel a")]
+      .find((a) => a.textContent.includes("Refresh filters")).click();
+  });
+  await p.waitForTimeout(200);
+  check("Refresh filters fires the wwwtopdf.adblock sentinel", (() => {
+    if (!adblockNavUrl) return false;
+    const u = new URL(adblockNavUrl);
+    return u.hostname === "wwwtopdf.adblock" && u.searchParams.get("action") === "refresh";
+  })());
+  // A later engine push (Rust re-harvest) replaces the set live.
+  await p.evaluate(() => window.wwwToPdf.setAdblockSelectors(["#custom-ad", ".adsbygoogle"]));
+  check("post-mount engine push updates hiding live", await p.evaluate(() =>
+    getComputedStyle(document.getElementById("ad1")).display === "none"
+  ));
+  await p.close();
+}
+
 await browser.close();
 
 let ok = true;

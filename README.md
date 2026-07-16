@@ -11,8 +11,11 @@ lets you jump straight back to any of them:
    title once loaded). The one webview then navigates to the site in place.
    Clicking **Link** in the breadcrumb returns here.
 2. **Edit** — log in if needed, then click elements to remove clutter (nav
-   bars, cookie banners, ads…). Removal sets save as **presets**, re-applied on
-   later visits or on other sites with the same layout (e.g. any Substack).
+   bars, cookie banners, ads…). A built-in **ad blocker** (Bushido-style —
+   EasyList cosmetic filters via Brave's adblock engine) hides known ad
+   containers automatically; toggle it in the pane. Removal sets save as
+   **presets**, re-applied on later visits or on other sites with the same
+   layout (e.g. any Substack).
 3. **Format** — "Next" flips the toolbar to formatting: body size, line height,
    heading scale, per-side margins (US Letter), a sans-serif metadata header
    (title, URL, author, access date, notes), and header/footer with optional
@@ -113,6 +116,35 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   webview alongside the editor (the remote page has no IPC to ask with), and
   save/update/delete arrive via the `wwwtopdf.preset` sentinel navigation,
   which evals the refreshed list back into the toolbar.
+- **Removals stick (no resurrection):** hiding is a class + CSS rule, and
+  ad-heavy pages resurrect "removed" containers constantly — a framework
+  re-render or ad refresh replaces the node (fresh element, no class) or
+  rewrites `className` wholesale, and the pre-capture reflow (the renderer
+  resizes the webview) looks like a viewport change that ad slots refresh
+  into. Two layers stop this. A MutationObserver re-asserts every recorded
+  removal the moment the page mutates (re-adds a wiped class, re-removes
+  replaced nodes via the recorded selector, re-creates the style element if
+  the page tears it out); observer callbacks are microtasks, which run before
+  the next paint, so a resurrected ad can never reach the frame `createPDF`
+  snapshots. And the renderer **freezes the page's JS for the whole capture
+  window**: before the reflow it cancels every pending timeout / interval /
+  animation frame and stubs the scheduling APIs (`__captureFreeze`), restoring
+  them after capture (`__captureThaw`) — no script runs between removing
+  elements and producing the PDF.
+- **Ad blocker (Bushido-style):** cosmetic filtering the way the
+  [Bushido browser](https://github.com/visualstudioblyat/bushido) does it,
+  built on Brave's MPL-2.0 [`adblock-rust`](https://github.com/brave/adblock-rust)
+  engine (`src-tauri/src/bushido.rs`) — no GPL code is taken from Bushido
+  itself. **EasyList** is downloaded at first run (not redistributed with the
+  app), cached in the app data dir, and refreshed weekly. On each page load
+  Rust harvests the page's class names/ids, asks the engine for the matching
+  hide-selectors (URL-specific rules + generic rules keyed to the harvest,
+  minus that site's `#@#`/`generichide` exceptions) and pushes them into the
+  editor, which hides matches with plain CSS — so ads injected later die on
+  arrival. The Edit pane has the "Block ads" toggle and a "↻ Refresh filters"
+  link (the `wwwtopdf.adblock` sentinel) for ad units that load late. The web
+  build — and a native first run while offline — falls back to a small
+  built-in list of unambiguous ad selectors.
 - **Stage 4 save:** a native save dialog (`tauri-plugin-dialog`); the chosen
   location receives a *copy of the previewed file*, so the saved PDF is
   byte-identical to what was on screen. On iOS the same button hands the file
@@ -216,6 +248,7 @@ src/main.js           web controller: iframe load, cross-origin fallback, Tauri 
 src/ui.css            app chrome
 public/editor.js      the shared editing engine (iframe inject / native)
 src-tauri/            Tauri 2 native app
+src-tauri/src/bushido.rs  ad-block engine (EasyList via Brave's adblock-rust)
 src-tauri/assets/     vendored pdf.js (UMD build + worker) for the inline preview
 .github/workflows/    Pages deploy
 ```

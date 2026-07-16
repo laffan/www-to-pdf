@@ -50,6 +50,12 @@
       show: false,
     },
     panelPos: { right: 16, top: 16 },
+    // Bushido-style cosmetic ad blocking. `selectors` comes from the native
+    // adblock engine (EasyList via adblock-rust) when available, else from the
+    // built-in fallback list; hiding is a CSS rule so it also kills matching
+    // nodes injected later. `userChoice` remembers an explicit toggle so an
+    // engine update can't re-enable what the user turned off.
+    adblock: { enabled: false, userChoice: null, source: "", selectors: [], cssText: "" },
   };
 
   // ---- small helpers -------------------------------------------------------
@@ -119,6 +125,7 @@
     s.textContent = [
       pageRule,
       "." + NS + "-removed{display:none!important}",
+      state.adblock.enabled ? state.adblock.cssText : "",
       "." + NS + "-hi{outline:2px solid #e11d48!important;outline-offset:-2px!important;cursor:crosshair!important;background:rgba(225,29,72,.08)!important}",
       bodyRule,
       hs !== 1 ? headRule : "",
@@ -216,6 +223,7 @@
     // Record a durable selector alongside the node so the removal set can be
     // saved as a preset and replayed on a fresh load of a similar page.
     state.removed.push({ el: t, sel: cssPath(t) });
+    track(t);
     updateCounts();
   }
   function panelContains(node) {
@@ -235,15 +243,183 @@
   }
   function undo() {
     var r = state.removed.pop();
-    if (r) r.el.classList.remove(NS + "-removed");
+    if (r) {
+      // Untrack BEFORE unhiding so the enforcement observer reads the class
+      // change as intentional and doesn't re-remove the element.
+      untrack(r.el);
+      r.el.classList.remove(NS + "-removed");
+    }
     updateCounts();
   }
   function resetRemoved() {
     state.removed.forEach(function (r) {
+      untrack(r.el);
       r.el.classList.remove(NS + "-removed");
     });
     state.removed = [];
     updateCounts();
+  }
+
+  // ---- removal enforcement ---------------------------------------------------
+  // Hiding is just a class + CSS rule, so the page's own JS can resurrect a
+  // "removed" element: ad scripts and framework re-renders replace nodes
+  // wholesale (fresh element, no class) or rewrite `className`, wiping ours.
+  // Both happen constantly on ad-heavy sites — especially during the native
+  // renderer's pre-capture reflow, which ad slots treat as a window resize and
+  // refresh into. This layer makes removals stick: a MutationObserver
+  // re-asserts every recorded removal the moment the page mutates, adopting
+  // replacement nodes via the recorded selector. Observer callbacks are
+  // microtasks, which run before the next paint — a resurrected ad can never
+  // reach the rendered frame that the PDF capture snapshots.
+  var tracked = typeof WeakSet !== "undefined" ? new WeakSet() : null;
+  function track(node) {
+    if (tracked && node) tracked.add(node);
+  }
+  function untrack(node) {
+    if (tracked && node) tracked.delete(node);
+  }
+  var enforcer = null;
+
+  function enforceRemovals() {
+    // All hiding lives in our <style>; re-create it first if the page tore it out.
+    if (!document.getElementById(NS + "-style")) ensureStyle();
+    var vanished = [];
+    var changed = false;
+    state.removed.forEach(function (r) {
+      if (r.el && r.el.isConnected) {
+        if (!r.el.classList.contains(NS + "-removed")) {
+          // The page wiped the class (className rewrite / re-render in place).
+          r.el.classList.add(NS + "-removed");
+          track(r.el);
+          changed = true;
+        }
+      } else if (r.sel) {
+        vanished.push(r);
+      }
+    });
+    // A removed node left the DOM: the page replaced it. Re-remove whatever
+    // its selector matches now — the first match takes the old entry's place
+    // (so Undo / Reset keep working); any extra matches become new entries,
+    // exactly as if a preset had removed them.
+    vanished.forEach(function (r) {
+      var nodes;
+      try {
+        nodes = document.querySelectorAll(r.sel);
+      } catch (e) {
+        return;
+      }
+      var adopted = false;
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (panelContains(n)) continue;
+        if (n === document.body || n === document.documentElement) continue;
+        if (n.classList.contains(NS + "-removed")) continue;
+        n.classList.add(NS + "-removed");
+        track(n);
+        if (!adopted) {
+          r.el = n;
+          adopted = true;
+        } else {
+          state.removed.push({ el: n, sel: r.sel });
+        }
+        changed = true;
+      }
+    });
+    if (changed) updateCounts();
+    return changed;
+  }
+
+  function ensureEnforcer() {
+    if (enforcer || typeof MutationObserver === "undefined") return;
+    enforcer = new MutationObserver(function (muts) {
+      if (!state.removed.length && !state.adblock.enabled) return;
+      for (var i = 0; i < muts.length; i++) {
+        var m = muts[i];
+        if (m.type === "childList") {
+          if (m.addedNodes.length || m.removedNodes.length) {
+            enforceRemovals();
+            return;
+          }
+        } else if (m.type === "attributes") {
+          // Busy pages toggle classes constantly; only a TRACKED node losing
+          // our class is worth a sweep.
+          var t = m.target;
+          if (
+            t && t.nodeType === 1 && tracked && tracked.has(t) &&
+            !t.classList.contains(NS + "-removed")
+          ) {
+            enforceRemovals();
+            return;
+          }
+        }
+      }
+    });
+    enforcer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class"],
+    });
+  }
+  function stopEnforcer() {
+    if (enforcer) {
+      enforcer.disconnect();
+      enforcer = null;
+    }
+  }
+
+  // ---- capture freeze --------------------------------------------------------
+  // No page JS may run between removing elements and producing the PDF. The
+  // native renderer calls __captureFreeze() before it reflows/captures and
+  // __captureThaw() when the capture is over. Freezing (1) re-asserts every
+  // removal synchronously, (2) cancels all pending timeouts / intervals /
+  // animation frames, and (3) stubs the scheduling APIs so nothing new can be
+  // queued — ad scripts observe the pre-capture resize, but their refresh
+  // callbacks never fire. Anything that still slips through (a fetch handler
+  // already in flight, code holding pre-freeze references to setTimeout) is
+  // caught by the enforcement observer above. Thaw restores the real APIs;
+  // page timers pending before the freeze stay cancelled — for a capture
+  // surface, that's the point.
+  var _frozen = null;
+  function captureFreeze() {
+    enforceRemovals();
+    if (_frozen) return;
+    var w = window;
+    _frozen = {
+      st: w.setTimeout,
+      si: w.setInterval,
+      raf: w.requestAnimationFrame,
+      ric: w.requestIdleCallback,
+    };
+    try {
+      // Timeout and interval ids share one id space, counting up from 1, and
+      // clearTimeout/clearInterval are interchangeable per the HTML spec.
+      var last = _frozen.st.call(w, function () {}, 0);
+      for (var i = 1; i <= last && i < 2000000; i++) {
+        w.clearTimeout(i);
+        w.clearInterval(i);
+      }
+    } catch (e) {}
+    try {
+      if (_frozen.raf) {
+        var lastRaf = _frozen.raf.call(w, function () {});
+        for (var j = 1; j <= lastRaf && j < 2000000; j++) w.cancelAnimationFrame(j);
+      }
+    } catch (e) {}
+    var fake = 1000000000; // far above any real id, so clears stay harmless
+    w.setTimeout = function () { return ++fake; };
+    w.setInterval = function () { return ++fake; };
+    if (_frozen.raf) w.requestAnimationFrame = function () { return ++fake; };
+    if (_frozen.ric) w.requestIdleCallback = function () { return ++fake; };
+  }
+  function captureThaw() {
+    if (!_frozen) return;
+    var w = window;
+    w.setTimeout = _frozen.st;
+    w.setInterval = _frozen.si;
+    if (_frozen.raf) w.requestAnimationFrame = _frozen.raf;
+    if (_frozen.ric) w.requestIdleCallback = _frozen.ric;
+    _frozen = null;
   }
 
   // ---- durable selectors + presets -------------------------------------------
@@ -314,6 +490,7 @@
         if (n.classList.contains(NS + "-removed")) continue;
         n.classList.add(NS + "-removed");
         state.removed.push({ el: n, sel: sel });
+        track(n);
         applied++;
       }
     });
@@ -327,6 +504,152 @@
   function updateCounts() {
     var c = document.getElementById(NS + "-count");
     if (c) c.textContent = state.removed.length + " removed";
+  }
+
+  // ---- Bushido ad blocking ---------------------------------------------------
+  // Cosmetic ad filtering in the spirit of the Bushido browser: hide anything
+  // matching known ad selectors. The native app computes the set with Brave's
+  // adblock-rust engine over EasyList for the loaded URL and pushes it in via
+  // wwwToPdf.setAdblockSelectors (replacing this fallback); where no engine is
+  // available — the web build, or a native first run while offline — a small
+  // built-in list of unambiguous ad selectors applies instead. Hiding is a CSS
+  // rule, so nodes injected AFTER it's applied are dead on arrival too.
+  var BUILTIN_AD_SELECTORS = [
+    ".adsbygoogle",
+    "[id^='div-gpt-ad']",
+    "[id^='google_ads_iframe']",
+    "iframe[id^='google_ads_frame']",
+    "iframe[src*='doubleclick.net']",
+    "iframe[src*='googlesyndication.com']",
+    "iframe[src*='adsystem.']",
+    "[data-ad-slot]",
+    "[data-google-query-id]",
+    "[data-testid='StandardAd']",
+    "[aria-label='Advertisement' i]",
+    ".ad-slot",
+    ".ad-banner",
+    ".ad-container",
+    ".ad-wrapper",
+    ".ad-unit",
+    ".advertisement",
+    "#sponsored-recirc",
+    ".GoogleActiveViewElement",
+  ];
+
+  // Group into rules of 50 so one selector the engine can't parse (rejected
+  // individually below, but belt-and-braces) can't invalidate everything.
+  function buildAdblockCss(sels) {
+    var rules = [];
+    for (var i = 0; i < sels.length; i += 50) {
+      rules.push(sels.slice(i, i + 50).join(",") + "{display:none!important}");
+    }
+    return rules.join("\n");
+  }
+  function setAdblockSelectors(list, source) {
+    var valid = [];
+    var seen = {};
+    (Array.isArray(list) ? list : []).forEach(function (sel) {
+      if (typeof sel !== "string") return;
+      sel = sel.trim();
+      if (!sel || seen[sel]) return;
+      seen[sel] = 1;
+      try {
+        document.querySelector(sel); // this engine can't parse it -> skip
+      } catch (e) {
+        return;
+      }
+      valid.push(sel);
+    });
+    state.adblock.selectors = valid;
+    state.adblock.source = source || "engine";
+    state.adblock.cssText = buildAdblockCss(valid);
+    if (state.adblock.userChoice !== false) {
+      state.adblock.enabled = valid.length > 0;
+    }
+    render_style();
+    refreshAdblockUI();
+  }
+  function adblockMatchedCount() {
+    if (!state.adblock.enabled || typeof Set === "undefined") return 0;
+    var found = new Set();
+    state.adblock.selectors.forEach(function (sel) {
+      var nodes;
+      try {
+        nodes = document.querySelectorAll(sel);
+      } catch (e) {
+        return;
+      }
+      for (var i = 0; i < nodes.length; i++) {
+        if (!panelContains(nodes[i])) found.add(nodes[i]);
+      }
+    });
+    return found.size;
+  }
+  // Rebound to the real updater when the panel is built.
+  var refreshAdblockUI = function () {};
+  function buildAdblock(isNative) {
+    var cb = el("input", {
+      type: "checkbox",
+      onchange: function (e) {
+        state.adblock.userChoice = e.target.checked;
+        state.adblock.enabled = e.target.checked && state.adblock.selectors.length > 0;
+        render_style();
+        refreshAdblockUI();
+      },
+    });
+    var label = el(
+      "label",
+      { style: "display:flex;align-items:center;gap:8px;cursor:pointer;padding:2px 0" },
+      [cb, el("span", { style: "font-weight:600" }, ["Block ads"])]
+    );
+    var status = el("span", {
+      id: NS + "-adcount",
+      style: "font-size:11px;color:#71717a",
+    });
+    var rowKids = [status];
+    if (isNative) {
+      // Ask Rust to recompute the filter set (late-loading ads add classes/ids
+      // the first harvest missed). Same sentinel channel as everything else.
+      rowKids.push(
+        el(
+          "a",
+          {
+            href: "#",
+            title: "Recompute ad filters for this page",
+            style: "font:11px system-ui;color:#2563eb;text-decoration:none;cursor:pointer",
+            onclick: function (e) {
+              e.preventDefault();
+              window.location.href = "https://" + ADBLOCK_HOST + "/?action=refresh";
+            },
+          },
+          ["↻ Refresh filters"]
+        )
+      );
+    }
+    var row = el(
+      "div",
+      {
+        style:
+          "display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:2px",
+      },
+      rowKids
+    );
+    refreshAdblockUI = function () {
+      cb.checked = state.adblock.enabled;
+      if (!state.adblock.selectors.length) {
+        status.textContent = "No ad filters loaded yet";
+      } else {
+        var src =
+          state.adblock.source === "engine"
+            ? state.adblock.selectors.length + " EasyList filters"
+            : "built-in filters";
+        status.textContent = state.adblock.enabled
+          ? adblockMatchedCount() + " hidden · " + src
+          : "off · " + src;
+      }
+    };
+    refreshAdblockUI();
+    return el("div", {}, [label, row]);
   }
 
   // ---- panel UI ------------------------------------------------------------
@@ -445,6 +768,7 @@
       style: "font-size:11px;color:#71717a;text-align:right",
     });
     count.textContent = state.removed.length + " removed";
+    var adblockUI = buildAdblock(isNative);
 
     // ---- font controls ----
     function slider(label, min, max, val, step, oninput, valfmt) {
@@ -586,6 +910,8 @@
       panel.appendChild(removeRow);
       panel.appendChild(count);
       panel.appendChild(sep());
+      panel.appendChild(adblockUI);
+      panel.appendChild(sep());
       panel.appendChild(bodySlider);
       panel.appendChild(el("div", { style: "height:8px" }));
       panel.appendChild(lineSlider);
@@ -663,6 +989,8 @@
     paneEdit.appendChild(el("div", { style: "height:6px" }));
     paneEdit.appendChild(removeRow);
     paneEdit.appendChild(count);
+    paneEdit.appendChild(sep());
+    paneEdit.appendChild(adblockUI);
     paneEdit.appendChild(sep());
     paneEdit.appendChild(presetsUI);
     paneEdit.appendChild(sep());
@@ -871,9 +1199,11 @@
   //   wwwtopdf.export?action=save|preview&…  -> render this webview to a PDF
   //   wwwtopdf.home                          -> go back to URL entry
   //   wwwtopdf.preset?action=…               -> persist a preset
+  //   wwwtopdf.adblock?action=refresh        -> recompute ad filters for this page
   var EXPORT_HOST = "wwwtopdf.export";
   var HOME_HOST = "wwwtopdf.home";
   var PRESET_HOST = "wwwtopdf.preset";
+  var ADBLOCK_HOST = "wwwtopdf.adblock";
 
   // Fonts/metadata already live in the page DOM (createPDF captures them);
   // only margins + header/footer/page-numbers + filename need to reach Rust.
@@ -1115,12 +1445,22 @@
       document.addEventListener("mouseout", onOut, true);
       document.addEventListener("click", onClick, true);
     }
+    // Ad filters: the native engine may have pushed a set before the editor
+    // mounted (Rust stashes it on __WWWPDF_ADBLOCK); otherwise start with the
+    // built-in fallback list. A later engine push replaces it.
+    if (!state.adblock.selectors.length) {
+      var pushed = Array.isArray(window.__WWWPDF_ADBLOCK) ? window.__WWWPDF_ADBLOCK : null;
+      setAdblockSelectors(pushed || BUILTIN_AD_SELECTORS, pushed ? "engine" : "builtin");
+    }
+    ensureEnforcer();
     window.wwwToPdf.__mounted = true;
     return window.wwwToPdf;
   }
   function unmount() {
     setRemoveMode(false);
     closePreview();
+    stopEnforcer();
+    captureThaw();
     document.removeEventListener("mouseover", onOver, true);
     document.removeEventListener("mouseout", onOut, true);
     document.removeEventListener("click", onClick, true);
@@ -1139,6 +1479,15 @@
   window.wwwToPdf.__pvBegin = pvBegin;
   window.wwwToPdf.__pvChunk = pvChunk;
   window.wwwToPdf.__pvEnd = pvEnd;
+  // Ad blocking: Rust pushes the engine-computed selector set for this URL.
+  window.wwwToPdf.setAdblockSelectors = function (list) {
+    setAdblockSelectors(list, "engine");
+  };
+  // Capture window: Rust freezes the page's JS before the pre-capture reflow
+  // and thaws it once the PDF bytes exist. Exposed for the capture scripts.
+  window.wwwToPdf.__captureFreeze = captureFreeze;
+  window.wwwToPdf.__captureThaw = captureThaw;
+  window.wwwToPdf.__enforceRemovals = enforceRemovals;
 
   // The single native webview also shows our own app UI (the URL-entry page),
   // which sets __WWWPDF_IS_APP. Don't mount the editor there.
