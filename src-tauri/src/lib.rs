@@ -36,6 +36,7 @@ const PDF_JS_WORKER: &str = include_str!("../assets/pdf.worker.min.js");
 const EXPORT_HOST: &str = "wwwtopdf.export"; // ?action=save|preview&margins…
 const HOME_HOST: &str = "wwwtopdf.home"; // back to URL entry
 const PRESET_HOST: &str = "wwwtopdf.preset"; // ?action=save|update|delete…
+const LOAD_HOST: &str = "wwwtopdf.load"; // ?url=… -> native WKWebView load
 
 /// A saved removal set: CSS selectors recorded when elements were clicked,
 /// replayable on any page with similar markup. Stored in the app data dir;
@@ -154,6 +155,13 @@ fn handle_preset_nav(app: &tauri::AppHandle, url: &Url) {
 struct AppState {
     // The URL-entry page to return to when the user picks "New URL".
     home: Mutex<Option<Url>>,
+    // The URL string most recently asked to load (verbatim from the entry
+    // screen). Used to key a captured page title to the same recent-list entry.
+    pending: Mutex<Option<String>>,
+    // Captured page titles, keyed by that entry URL, pushed into the app page's
+    // recent list when it next loads (the target page is a different origin, so
+    // it can't write the app's localStorage itself).
+    titles: Mutex<std::collections::HashMap<String, String>>,
 }
 
 struct Margins {
@@ -216,9 +224,77 @@ fn handle_sentinel(app: &tauri::AppHandle, nav_url: &Url) -> bool {
             tauri::async_runtime::spawn(async move { handle_preset_nav(&app, &url) });
             true
         }
+        Some(LOAD_HOST) => {
+            // Load the target with a NATIVE webview load (WKWebView.load), not a
+            // JS location change. Apple only opens Universal Links for user link
+            // activations, never for a host-initiated load — so this avoids the
+            // "an installed app (Substack, …) grabs the URL and the webview
+            // hangs" hijack. Remember the entered URL to key the page title.
+            if let Some(target) = nav_url
+                .query_pairs()
+                .find(|(k, _)| k == "url")
+                .map(|(_, v)| v.into_owned())
+            {
+                *app.state::<AppState>().pending.lock().unwrap() = Some(target.clone());
+                if let Ok(u) = Url::parse(&target) {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(mut w) = app.get_webview_window("main") {
+                            let _ = w.navigate(u);
+                        }
+                    });
+                }
+            }
+            true
+        }
         _ => false,
     }
 }
+
+/// Push every captured page title into the app page's recent list. The target
+/// pages are foreign origins, so they can't touch the app's localStorage — Rust
+/// relays the titles when the app (URL-entry) page is (re)loaded.
+fn push_history_titles(app: &tauri::AppHandle) {
+    let titles = app.state::<AppState>().titles.lock().unwrap().clone();
+    if titles.is_empty() {
+        return;
+    }
+    if let Some(w) = app.get_webview_window("main") {
+        for (u, t) in titles {
+            let uj = serde_json::to_string(&u).unwrap_or_else(|_| "\"\"".into());
+            let tj = serde_json::to_string(&t).unwrap_or_else(|_| "\"\"".into());
+            let _ = w.eval(&format!(
+                "window.__wwwpdfSetHistoryTitle&&window.__wwwpdfSetHistoryTitle({uj},{tj})"
+            ));
+        }
+    }
+}
+
+/// Capture the just-loaded target page's document.title, keyed to the entry URL
+/// that requested it, for the recent list. Apple-only (needs a JS eval that
+/// returns a value); a no-op elsewhere.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn capture_history_title(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let key = app.state::<AppState>().pending.lock().unwrap().clone();
+        let Some(key) = key else { return };
+        if let Some(w) = app.get_webview_window("main") {
+            if let Ok(title) = eval_js_string(&w, "document.title").await {
+                let t = title.trim().to_string();
+                if !t.is_empty() {
+                    app.state::<AppState>()
+                        .titles
+                        .lock()
+                        .unwrap()
+                        .insert(key, t);
+                }
+            }
+        }
+    });
+}
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn capture_history_title(_app: &tauri::AppHandle) {}
 
 /// Render the current webview to the preview PDF, then save or preview it.
 async fn do_export(app: tauri::AppHandle, url: Url) {
@@ -1171,14 +1247,16 @@ pub fn run() {
                         }
                         // The first page that finishes loading is our own
                         // URL-entry page; remember it as "home" so "New URL"
-                        // can return here.
-                        {
+                        // can return here. is_home tells this page apart from a
+                        // loaded target site.
+                        let is_home = {
                             let state = load_handle.state::<AppState>();
                             let mut home = state.home.lock().unwrap();
                             if home.is_none() {
                                 *home = Some(payload.url().clone());
                             }
-                        }
+                            home.as_ref() == Some(payload.url())
+                        };
                         // Push current presets to each freshly-loaded page so a
                         // page opened after a preset change isn't stuck with the
                         // startup snapshot from the init script.
@@ -1187,6 +1265,14 @@ pub fn run() {
                             let _ = w.eval(&format!(
                                 "window.wwwToPdf&&window.wwwToPdf.presetsUpdated&&window.wwwToPdf.presetsUpdated({json})"
                             ));
+                        }
+                        if is_home {
+                            // Back on the URL-entry page: fill the recent list
+                            // with the titles captured from visited pages.
+                            push_history_titles(&load_handle);
+                        } else {
+                            // A target site finished loading: record its title.
+                            capture_history_title(&load_handle);
                         }
                     });
             // Desktop gets an initial + minimum window size. On mobile the window

@@ -196,10 +196,13 @@ in Xcode (`gen/apple`) or as `bundle.iOS.developmentTeam` in `tauri.conf.json`.
 > inline pdf.js preview, render, share) works on iPhone and iPad. Device fixes
 > applied so far: the webview fills the screen and tracks rotation/Stage-Manager
 > resizes (`fit_webview_to_superview` pins it to its superview with a flexible
-> autoresizing mask; `inner_size` is desktop-only), navigations are deferred out
-> of the tap's activation window so a site with an installed app (Substack, …)
-> loads in-app instead of being hijacked by a Universal Link, and the shared PDF
-> is named after the page title. Still worth watching: the share sheet's popover
+> autoresizing mask; `inner_size` is desktop-only); loads go through a native
+> `webview.navigate()` (the `wwwtopdf.load` sentinel) rather than a JS location
+> change, so a site with an installed app loads in-app instead of being hijacked
+> by a Universal Link; the shared PDF is named after the page title; and the
+> recent list shows page titles (Rust captures each visited page's title and
+> relays it to the app page, which the target origin can't write itself). Still
+> worth watching: the share sheet's popover
 > anchoring on iPad, and whether the phone bottom-sheet's `env(safe-area-inset-*)`
 > values resolve (they need a `viewport-fit=cover` viewport, which the editor
 > appends only when the page already ships a viewport meta). Paste any build or
