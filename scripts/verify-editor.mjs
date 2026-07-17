@@ -610,9 +610,10 @@ await appPage.close();
 }
 
 // 20. Capture freeze: no page JS may run between removing elements and the
-// PDF capture. Pending timers are cancelled, new scheduling is inert, and
-// anything that still mutates the DOM is caught by the enforcement observer.
-// Thaw restores the real APIs.
+// PDF capture. Hidden elements are physically DETACHED (a node outside the
+// DOM can't be resurrected by any style trick), pending timers are cancelled,
+// new scheduling is inert, and anything that still mutates the DOM is caught
+// by the enforcement observer. Thaw re-attaches and restores the real APIs.
 {
   const p = await browser.newPage();
   await p.setContent(SAMPLE, { waitUntil: "load" });
@@ -626,6 +627,12 @@ await appPage.close();
     setTimeout(() => { window.__reinjected = true; }, 100);
     window.wwwToPdf.__captureFreeze();
   });
+  check("freeze physically detaches removed elements (same-tag placeholder)",
+    await p.evaluate(() =>
+      document.getElementById("nav") === null &&
+      !!document.querySelector("nav[data-wwwpdf-hole]") &&
+      getComputedStyle(document.querySelector("nav[data-wwwpdf-hole]")).display === "none"
+    ));
   await p.waitForTimeout(300);
   check("freeze cancels timers the page had pending", await p.evaluate(() =>
     window.__reinjected === false
@@ -638,24 +645,74 @@ await appPage.close();
   }));
   await p.waitForTimeout(150);
   check("…and their callbacks never fire", await p.evaluate(() => window.__late === false));
-  // DOM mutation during the freeze (e.g. a fetch handler already in flight)
-  // is still corrected by the enforcement observer before any paint.
+  // DOM mutation during the freeze (e.g. a fetch handler already in flight
+  // injecting a NEW container that matches a removed selector) is still
+  // corrected by the enforcement observer before any paint.
   await p.evaluate(() => {
-    const old = document.getElementById("nav");
     const fresh = document.createElement("nav");
     fresh.id = "nav";
-    old.replaceWith(fresh);
+    fresh.textContent = "MID-CAPTURE AD";
+    document.body.appendChild(fresh);
   });
-  check("mutations during the freeze are still re-removed", await p.evaluate(() =>
+  check("new nodes matching a removed selector are hidden mid-capture", await p.evaluate(() =>
     getComputedStyle(document.getElementById("nav")).display === "none"
   ));
   await p.evaluate(() => { window.wwwToPdf.__captureThaw(); });
+  check("thaw re-attaches the original (still removed) and drops placeholders",
+    await p.evaluate(() => {
+      const navs = document.querySelectorAll("nav#nav");
+      return !document.querySelector("[data-wwwpdf-hole]") &&
+        navs.length === 2 && // the original is back; the mid-capture one stays
+        [...navs].every((n) => getComputedStyle(n).display === "none");
+    }));
   await p.evaluate(() => {
     window.__thawed = false;
     setTimeout(() => { window.__thawed = true; }, 10);
   });
   await p.waitForTimeout(120);
   check("thaw restores real timers", await p.evaluate(() => window.__thawed === true));
+  await p.close();
+}
+
+// 20c. The detach must not disturb the styling of KEPT content: display:none
+// elements still count for :nth-child, so placeholders have to keep sibling
+// positions (same tag, same slot) or zebra tables / sibling margins would
+// shift in the PDF relative to the edit view. Also: hiding must win the CSS
+// war on screen — anti-adblock rules like #id{display:block!important}
+// outrank a class rule, but not an important inline declaration.
+{
+  const p = await browser.newPage();
+  await p.setContent(`<!doctype html><html><head><style>
+      li { color: rgb(0, 0, 0); }
+      li:nth-child(3) { color: rgb(200, 0, 50); }
+      #zap { display: block !important; } /* anti-adblock: outranks any class rule */
+    </style></head><body>
+      <ul><li id="l1">one</li><li id="zap">AD</li><li id="l3">three</li></ul>
+    </body></html>`, { waitUntil: "load" });
+  await p.addScriptTag({ content: EDITOR });
+  await p.evaluate(() => { window.wwwToPdf.state.removeMode = true; });
+  await p.click("#zap");
+  await p.evaluate(() => { window.wwwToPdf.state.removeMode = false; });
+  check("removal beats a display:block!important id rule (inline important)",
+    await p.evaluate(() =>
+      getComputedStyle(document.getElementById("zap")).display === "none"
+    ));
+  await p.evaluate(() => window.wwwToPdf.__captureFreeze());
+  check("during capture, kept content keeps its :nth-child styling",
+    await p.evaluate(() =>
+      document.getElementById("zap") === null &&
+      getComputedStyle(document.getElementById("l3")).color === "rgb(200, 0, 50)"
+    ));
+  await p.evaluate(() => window.wwwToPdf.__captureThaw());
+  check("thaw restores the node; Undo restores its inline style exactly",
+    await p.evaluate(() => {
+      const zap = document.getElementById("zap");
+      const hiddenBack = !!zap && getComputedStyle(zap).display === "none";
+      [...document.querySelectorAll("#wwwpdf-panel button")]
+        .find((b) => b.textContent === "Undo").click();
+      return hiddenBack && getComputedStyle(zap).display !== "none" &&
+        !zap.getAttribute("style");
+    }));
   await p.close();
 }
 
@@ -735,6 +792,48 @@ const AD_SAMPLE = `<!doctype html><html><head><title>Ads</title></head><body>
   check("toggle back on applies the ENGINE set (replaces built-ins, skips bad selectors)",
     (await hidden("custom-ad")) && !(await hidden("ad1")) && await p.evaluate(() =>
       /EasyList/.test(document.getElementById("wwwpdf-adcount").textContent)));
+  // Ad-blocked elements are detached for the capture too, and come back.
+  await p.evaluate(() => window.wwwToPdf.__captureFreeze());
+  check("capture detaches ad-blocked elements as well", await p.evaluate(() =>
+    document.getElementById("custom-ad") === null &&
+    !!document.querySelector("div[data-wwwpdf-hole]")
+  ));
+  await p.evaluate(() => window.wwwToPdf.__captureThaw());
+  check("thaw restores ad-blocked elements (still hidden)", await p.evaluate(() => {
+    const ad = document.getElementById("custom-ad");
+    return !!ad && getComputedStyle(ad).display === "none" &&
+      !document.querySelector("[data-wwwpdf-hole]");
+  }));
+  await p.close();
+}
+
+// 21b. Web export: window.print() snapshots the DOM, so the hidden elements
+// must be physically absent while the dialog is open and back afterwards.
+{
+  const p = await browser.newPage();
+  await p.setContent(SAMPLE, { waitUntil: "load" });
+  await p.addScriptTag({ content: EDITOR });
+  await p.evaluate(() => { window.wwwToPdf.state.removeMode = true; });
+  await p.click("#nav");
+  await p.evaluate(() => {
+    window.wwwToPdf.state.removeMode = false;
+    window.print = () => {
+      window.__printSawDetached = document.getElementById("nav") === null &&
+        !!document.querySelector("nav[data-wwwpdf-hole]");
+    };
+  });
+  await p.evaluate(() => {
+    [...document.querySelectorAll("#wwwpdf-panel button")]
+      .find((b) => b.textContent === "Save as PDF").click();
+  });
+  check("print dialog sees removed elements physically detached", await p.evaluate(() =>
+    window.__printSawDetached === true
+  ));
+  check("after print they are re-attached (and still removed)", await p.evaluate(() => {
+    const nav = document.getElementById("nav");
+    return !!nav && getComputedStyle(nav).display === "none" &&
+      !document.querySelector("[data-wwwpdf-hole]");
+  }));
   await p.close();
 }
 

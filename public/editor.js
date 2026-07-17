@@ -219,11 +219,10 @@
     e.stopPropagation();
     var t = e.target;
     t.classList.remove(NS + "-hi");
-    t.classList.add(NS + "-removed");
     // Record a durable selector alongside the node so the removal set can be
-    // saved as a preset and replayed on a fresh load of a similar page.
-    state.removed.push({ el: t, sel: cssPath(t) });
-    track(t);
+    // saved as a preset and replayed on a fresh load of a similar page, and
+    // the node's prior inline display so Undo can restore it exactly.
+    state.removed.push({ el: t, sel: cssPath(t), prev: hideNode(t) });
     updateCounts();
   }
   function panelContains(node) {
@@ -243,18 +242,12 @@
   }
   function undo() {
     var r = state.removed.pop();
-    if (r) {
-      // Untrack BEFORE unhiding so the enforcement observer reads the class
-      // change as intentional and doesn't re-remove the element.
-      untrack(r.el);
-      r.el.classList.remove(NS + "-removed");
-    }
+    if (r) unhideNode(r.el, r.prev);
     updateCounts();
   }
   function resetRemoved() {
     state.removed.forEach(function (r) {
-      untrack(r.el);
-      r.el.classList.remove(NS + "-removed");
+      unhideNode(r.el, r.prev);
     });
     state.removed = [];
     updateCounts();
@@ -280,6 +273,48 @@
   }
   var enforcer = null;
 
+  // Hide = class (for our CSS + bookkeeping) PLUS an inline
+  // display:none!important. The inline declaration is what wins the CSS war:
+  // anti-adblock rules like `#ad{display:block!important}` outrank a class
+  // rule on specificity, but nothing in a stylesheet outranks an important
+  // inline declaration.
+  function reassert(n) {
+    n.classList.add(NS + "-removed");
+    try {
+      n.style.setProperty("display", "none", "important");
+    } catch (e) {}
+    track(n);
+  }
+  function isHidden(n) {
+    return (
+      n.classList.contains(NS + "-removed") &&
+      n.style.getPropertyValue("display") === "none" &&
+      n.style.getPropertyPriority("display") === "important"
+    );
+  }
+  // Returns the node's prior inline display ({v, p}) so Undo can restore it.
+  function hideNode(n) {
+    var prev = null;
+    try {
+      prev = {
+        v: n.style.getPropertyValue("display"),
+        p: n.style.getPropertyPriority("display"),
+      };
+    } catch (e) {}
+    reassert(n);
+    return prev;
+  }
+  function unhideNode(n, prev) {
+    // Untrack BEFORE unhiding so the enforcement observer reads the change
+    // as intentional and doesn't re-remove the element.
+    untrack(n);
+    n.classList.remove(NS + "-removed");
+    try {
+      if (prev && prev.v) n.style.setProperty("display", prev.v, prev.p);
+      else n.style.removeProperty("display");
+    } catch (e) {}
+  }
+
   function enforceRemovals() {
     // All hiding lives in our <style>; re-create it first if the page tore it out.
     if (!document.getElementById(NS + "-style")) ensureStyle();
@@ -287,21 +322,23 @@
     var changed = false;
     state.removed.forEach(function (r) {
       if (r.el && r.el.isConnected) {
-        if (!r.el.classList.contains(NS + "-removed")) {
-          // The page wiped the class (className rewrite / re-render in place).
-          r.el.classList.add(NS + "-removed");
-          track(r.el);
+        if (!isHidden(r.el)) {
+          // The page wiped the class or the inline style (className rewrite,
+          // style-attribute overwrite, re-render in place).
+          reassert(r.el);
           changed = true;
         }
       } else if (r.sel) {
         vanished.push(r);
       }
     });
-    // A removed node left the DOM: the page replaced it. Re-remove whatever
-    // its selector matches now — the first match takes the old entry's place
-    // (so Undo / Reset keep working); any extra matches become new entries,
-    // exactly as if a preset had removed them.
+    // A removed node left the DOM. Either the capture detached it (detained:
+    // it returns on thaw — just police NEW matches of its selector), or the
+    // page replaced it: re-remove whatever the selector matches now — the
+    // first match takes the old entry's place (so Undo / Reset keep working);
+    // extra matches become new entries, exactly as if a preset removed them.
     vanished.forEach(function (r) {
+      var detained = _detachedSet && _detachedSet.has(r.el);
       var nodes;
       try {
         nodes = document.querySelectorAll(r.sel);
@@ -313,20 +350,98 @@
         var n = nodes[i];
         if (panelContains(n)) continue;
         if (n === document.body || n === document.documentElement) continue;
-        if (n.classList.contains(NS + "-removed")) continue;
-        n.classList.add(NS + "-removed");
-        track(n);
-        if (!adopted) {
+        if (n.hasAttribute && n.hasAttribute("data-" + NS + "-hole")) continue;
+        if (isHidden(n)) continue;
+        var prev = hideNode(n);
+        if (!detained && !adopted) {
           r.el = n;
+          r.prev = prev;
           adopted = true;
         } else {
-          state.removed.push({ el: n, sel: r.sel });
+          state.removed.push({ el: n, sel: r.sel, prev: prev });
         }
         changed = true;
       }
     });
     if (changed) updateCounts();
     return changed;
+  }
+
+  // ---- capture detach --------------------------------------------------------
+  // For the capture itself, winning the CSS war still isn't the last word — so
+  // hidden elements are physically DETACHED from the DOM while the renderer
+  // (or the web print dialog) takes its snapshot: a node that isn't in the
+  // document cannot be resurrected by any style trick. Each node is swapped
+  // for an inert placeholder of the SAME tag (display:none, no attributes),
+  // so sibling-structure styling of the kept content (:nth-child,
+  // :nth-of-type, adjacent-sibling rules) doesn't shift — display:none
+  // elements still count as siblings, and so do the placeholders. Thaw swaps
+  // the originals back, which is what keeps Undo meaningful after a render.
+  var _detached = null; // [{ph, el}] while a capture/print is in flight
+  var _detachedSet = null;
+  function detachForCapture() {
+    if (_detached) return;
+    enforceRemovals();
+    _detached = [];
+    _detachedSet = typeof WeakSet !== "undefined" ? new WeakSet() : null;
+    var targets = [];
+    var seen = typeof Set !== "undefined" ? new Set() : null;
+    function target(n) {
+      if (seen) {
+        if (seen.has(n)) return;
+        seen.add(n);
+      }
+      targets.push(n);
+    }
+    state.removed.forEach(function (r) {
+      if (r.el && r.el.isConnected) target(r.el);
+    });
+    if (state.adblock.enabled) {
+      state.adblock.selectors.forEach(function (sel) {
+        var nodes;
+        try {
+          nodes = document.querySelectorAll(sel);
+        } catch (e) {
+          return;
+        }
+        for (var i = 0; i < nodes.length; i++) {
+          var n = nodes[i];
+          if (panelContains(n)) continue;
+          if (n === document.body || n === document.documentElement) continue;
+          target(n);
+        }
+      });
+    }
+    targets.forEach(function (n) {
+      // A node inside an already-detached subtree leaves (and returns) with it.
+      if (!n.parentNode || !n.isConnected) return;
+      var ph;
+      try {
+        ph = document.createElement(n.tagName);
+      } catch (e) {
+        ph = document.createElement("div");
+      }
+      ph.setAttribute("data-" + NS + "-hole", "");
+      try {
+        ph.style.setProperty("display", "none", "important");
+      } catch (e) {}
+      try {
+        n.parentNode.replaceChild(ph, n);
+        _detached.push({ ph: ph, el: n });
+        if (_detachedSet) _detachedSet.add(n);
+      } catch (e) {}
+    });
+  }
+  function reattachAfterCapture() {
+    if (!_detached) return;
+    _detached.forEach(function (d) {
+      try {
+        if (d.ph.parentNode) d.ph.parentNode.replaceChild(d.el, d.ph);
+        else d.ph.remove();
+      } catch (e) {}
+    });
+    _detached = null;
+    _detachedSet = null;
   }
 
   function ensureEnforcer() {
@@ -341,13 +456,11 @@
             return;
           }
         } else if (m.type === "attributes") {
-          // Busy pages toggle classes constantly; only a TRACKED node losing
-          // our class is worth a sweep.
+          // Busy pages rewrite class/style constantly; only a TRACKED node
+          // losing its hiding (class wiped, or inline display overridden) is
+          // worth a sweep.
           var t = m.target;
-          if (
-            t && t.nodeType === 1 && tracked && tracked.has(t) &&
-            !t.classList.contains(NS + "-removed")
-          ) {
+          if (t && t.nodeType === 1 && tracked && tracked.has(t) && !isHidden(t)) {
             enforceRemovals();
             return;
           }
@@ -358,7 +471,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["class"],
+      attributeFilter: ["class", "style"],
     });
   }
   function stopEnforcer() {
@@ -372,17 +485,20 @@
   // No page JS may run between removing elements and producing the PDF. The
   // native renderer calls __captureFreeze() before it reflows/captures and
   // __captureThaw() when the capture is over. Freezing (1) re-asserts every
-  // removal synchronously, (2) cancels all pending timeouts / intervals /
-  // animation frames, and (3) stubs the scheduling APIs so nothing new can be
-  // queued — ad scripts observe the pre-capture resize, but their refresh
-  // callbacks never fire. Anything that still slips through (a fetch handler
-  // already in flight, code holding pre-freeze references to setTimeout) is
-  // caught by the enforcement observer above. Thaw restores the real APIs;
-  // page timers pending before the freeze stay cancelled — for a capture
-  // surface, that's the point.
+  // removal and physically detaches the hidden elements (capture detach,
+  // above), (2) cancels all pending timeouts / intervals / animation frames,
+  // and (3) stubs the scheduling APIs so nothing new can be queued — ad
+  // scripts observe the pre-capture resize, but their refresh callbacks never
+  // fire. Anything that still slips through (a fetch handler already in
+  // flight, code holding pre-freeze references to setTimeout) is caught by
+  // the enforcement observer above. Thaw re-attaches the detached elements
+  // and restores the real APIs; page timers pending before the freeze stay
+  // cancelled — for a capture surface, that's the point.
   var _frozen = null;
   function captureFreeze() {
-    enforceRemovals();
+    // Re-assert removals, then take the hidden elements out of the DOM
+    // entirely for the duration of the capture.
+    detachForCapture();
     if (_frozen) return;
     var w = window;
     _frozen = {
@@ -413,6 +529,7 @@
     if (_frozen.ric) w.requestIdleCallback = function () { return ++fake; };
   }
   function captureThaw() {
+    reattachAfterCapture();
     if (!_frozen) return;
     var w = window;
     w.setTimeout = _frozen.st;
@@ -488,9 +605,7 @@
         if (panelContains(n)) continue;
         if (n === document.body || n === document.documentElement) continue;
         if (n.classList.contains(NS + "-removed")) continue;
-        n.classList.add(NS + "-removed");
-        state.removed.push({ el: n, sel: sel });
-        track(n);
+        state.removed.push({ el: n, sel: sel, prev: hideNode(n) });
         applied++;
       }
     });
@@ -1381,9 +1496,24 @@
       var handled = window.wwwToPdf.onExport(collect());
       if (handled === true) return;
     }
-    // Web path: the browser's print dialog (choose "Save as PDF").
-    window.focus();
-    window.print();
+    // Web path: the browser's print dialog (choose "Save as PDF"). Print with
+    // the hidden elements physically absent — the dialog snapshots the DOM,
+    // and a site's own display:block!important rules can't resurrect what
+    // isn't in the document. Restored as soon as the snapshot is taken
+    // (print() blocks while the dialog is open; afterprint is the backup for
+    // engines where it doesn't).
+    detachForCapture();
+    var restore = function () {
+      window.removeEventListener("afterprint", restore);
+      reattachAfterCapture();
+    };
+    window.addEventListener("afterprint", restore);
+    try {
+      window.focus();
+      window.print();
+    } finally {
+      restore();
+    }
   }
 
   function toast(msg) {

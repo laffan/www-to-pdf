@@ -116,21 +116,29 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   webview alongside the editor (the remote page has no IPC to ask with), and
   save/update/delete arrive via the `wwwtopdf.preset` sentinel navigation,
   which evals the refreshed list back into the toolbar.
-- **Removals stick (no resurrection):** hiding is a class + CSS rule, and
-  ad-heavy pages resurrect "removed" containers constantly — a framework
-  re-render or ad refresh replaces the node (fresh element, no class) or
-  rewrites `className` wholesale, and the pre-capture reflow (the renderer
-  resizes the webview) looks like a viewport change that ad slots refresh
-  into. Two layers stop this. A MutationObserver re-asserts every recorded
-  removal the moment the page mutates (re-adds a wiped class, re-removes
-  replaced nodes via the recorded selector, re-creates the style element if
-  the page tears it out); observer callbacks are microtasks, which run before
-  the next paint, so a resurrected ad can never reach the frame `createPDF`
-  snapshots. And the renderer **freezes the page's JS for the whole capture
-  window**: before the reflow it cancels every pending timeout / interval /
-  animation frame and stubs the scheduling APIs (`__captureFreeze`), restoring
-  them after capture (`__captureThaw`) — no script runs between removing
-  elements and producing the PDF.
+- **Removals stick (no resurrection):** ad-heavy pages resurrect "removed"
+  containers constantly — a framework re-render or ad refresh replaces the
+  node (fresh element, no class) or rewrites `className`/`style` wholesale,
+  and the pre-capture reflow (the renderer resizes the webview) looks like a
+  viewport change that ad slots refresh into. Three layers stop this.
+  Removal hides with a class **plus an inline `display:none !important`**
+  (anti-adblock CSS like `#ad{display:block!important}` outranks any class
+  rule on specificity, but nothing in a stylesheet outranks an important
+  inline declaration; Undo restores the prior inline value). A
+  MutationObserver re-asserts every removal the moment the page mutates
+  (re-adds wiped classes/styles, re-removes replaced nodes via the recorded
+  selector, re-creates the style element if the page tears it out); observer
+  callbacks are microtasks, which run before the next paint, so a resurrected
+  ad can never reach the frame `createPDF` snapshots. And for the capture
+  itself the renderer **freezes the page's JS and physically detaches every
+  hidden element** (`__captureFreeze`): pending timeouts / intervals /
+  animation frames are cancelled, the scheduling APIs are stubbed, and each
+  hidden node is swapped for an inert same-tag placeholder — a node outside
+  the DOM can't be resurrected by any style trick, while the placeholder
+  keeps sibling-structure styling (`:nth-child`, adjacent-sibling rules) of
+  the kept content from shifting. `__captureThaw` swaps the originals back
+  and restores the APIs, so Undo still works after a preview. The web build
+  does the same detach around `window.print()`.
 - **Ad blocker (Bushido-style):** cosmetic filtering the way the
   [Bushido browser](https://github.com/visualstudioblyat/bushido) does it,
   built on Brave's MPL-2.0 [`adblock-rust`](https://github.com/brave/adblock-rust)
