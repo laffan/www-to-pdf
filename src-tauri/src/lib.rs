@@ -19,6 +19,10 @@ use std::sync::Mutex;
 use tauri::{Manager, Url, WebviewUrl, WebviewWindowBuilder};
 
 mod bushido;
+mod paginate;
+use paginate::Margins;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use paginate::Meas;
 
 // The shared editor engine, embedded so the native build is self-contained.
 const EDITOR_JS: &str = include_str!("../../public/editor.js");
@@ -169,14 +173,6 @@ struct AppState {
     // start (EasyList parse takes a beat); None until then and when the list
     // can neither be read from cache nor downloaded.
     adblock: Mutex<Option<bushido::AdBlocker>>,
-}
-
-struct Margins {
-    // inches
-    top: f64,
-    right: f64,
-    bottom: f64,
-    left: f64,
 }
 
 /// Where the rendered PDF lives before saving/sharing. Must stay inside the
@@ -1004,10 +1000,13 @@ fn sanitize(s: &str) -> String {
 //   3. injected JS freezes the page's JS, hides the tool chrome and measures
 //      content height plus the bottom edge of every block element (safe
 //      page-break candidates);
-//   4. WKWebView.createPDF renders ONE tall page at exactly that width;
-//   5. paginate_tall_pdf (pure Rust, unit-tested) slices it into US-Letter
-//      pages at the user's margins, snapping breaks to paragraph gaps so no
-//      text line is ever split;
+//   4. WKWebView.createPDF captures the document — whole-view for short
+//      pages, page-aligned SEGMENTS (WKPDFConfiguration.rect) past ~7,800 px,
+//      because Core Graphics clamps a single PDF page to 14,400 pt and
+//      silently drops content past ~22 US-Letter pages;
+//   5. paginate::paginate_segments (pure Rust, unit-tested in paginate.rs)
+//      slices the segments into US-Letter pages at the user's margins,
+//      snapping breaks to measured line bottoms so no text line is ever split;
 //   6. the webview frame and chrome are restored (and the page thawed).
 // The same createPDF/evaluateJavaScript calls exist on iOS, so this path is
 // mobile-ready.
@@ -1047,17 +1046,6 @@ mod geom {
     }
 }
 
-/// Measurements reported by the injected capture-prep script.
-#[derive(serde::Deserialize)]
-struct Meas {
-    /// full document height, CSS px
-    h: f64,
-    /// actual layout width, CSS px (sanity signal: should equal the target)
-    w: f64,
-    /// bottom edges of block elements, CSS px from document top — safe breaks
-    b: Vec<f64>,
-}
-
 /// Runs inside the target page right before capture: hides the toolbar/toast/
 /// margin-guide (createPDF renders SCREEN media, so @media print rules don't
 /// apply here) and measures the document + safe break points.
@@ -1082,7 +1070,11 @@ const CAPTURE_PREP_JS: &str = r#"(function(){
       st.textContent='#wwwpdf-panel,#wwwpdf-toast,#wwwpdf-preview{display:none!important}html::after{display:none!important}';
       document.documentElement.appendChild(st);}
     var d=document,b=d.body,e=d.documentElement;
-    var h=Math.max(b?b.scrollHeight:0,e.scrollHeight,b?b.offsetHeight:0,e.offsetHeight);
+    // Content height from <body>, not documentElement: the settle phase has
+    // already grown the frame past the content, and documentElement.scrollHeight
+    // is max(content, frameHeight) — it would echo the frame, not the page.
+    var h=Math.max(b?b.scrollHeight:0,b?b.offsetHeight:0);
+    if(h<1)h=Math.max(e.scrollHeight,e.offsetHeight);
     var sy=window.scrollY||0;
     var pts=[];
     // Replaced/atomic content: bottoms are safe cuts.
@@ -1282,14 +1274,20 @@ async fn eval_js_string(webview: &tauri::WebviewWindow, script: &str) -> Result<
         .map_err(|_| "JS completion dropped".to_string())?
 }
 
-/// Render the webview's full content to PDF bytes via WKWebView.createPDF
-/// (nil configuration = the whole view; the frame is pre-sized to the full
-/// content height so the whole document is captured).
+/// Render webview content to PDF bytes via WKWebView.createPDF. With no rect
+/// the whole view is captured (nil configuration — the frame is pre-sized to
+/// the content height). With a rect, only that portion of the view renders
+/// (WKPDFConfiguration.rect, top-left origin, view coordinates) — used to
+/// capture tall documents in segments, because Core Graphics clamps a single
+/// PDF page to 14,400 pt (~22 US-Letter pages) and silently cuts the rest.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-async fn wk_create_pdf(webview: &tauri::WebviewWindow) -> Result<Vec<u8>, String> {
+async fn wk_create_pdf(
+    webview: &tauri::WebviewWindow,
+    rect: Option<geom::CGRect>,
+) -> Result<Vec<u8>, String> {
     use block2::RcBlock;
-    use objc2::msg_send;
     use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<Vec<u8>, String>>();
     let tx = std::sync::Mutex::new(Some(tx));
@@ -1301,6 +1299,14 @@ async fn wk_create_pdf(webview: &tauri::WebviewWindow) -> Result<Vec<u8>, String
                 let _ = tx.send(Err("webview handle was null".into()));
                 return;
             }
+            let config: *mut AnyObject = match rect {
+                Some(r) => {
+                    let c: *mut AnyObject = msg_send![class!(WKPDFConfiguration), new];
+                    let _: () = msg_send![c, setRect: r];
+                    c
+                }
+                None => std::ptr::null_mut(),
+            };
             let txc = std::sync::Mutex::new(Some(tx));
             let block = RcBlock::new(move |data: *mut AnyObject, err: *mut AnyObject| {
                 let Some(tx) = txc.lock().unwrap().take() else { return };
@@ -1327,9 +1333,13 @@ async fn wk_create_pdf(webview: &tauri::WebviewWindow) -> Result<Vec<u8>, String
             });
             let _: () = msg_send![
                 wk,
-                createPDFWithConfiguration: std::ptr::null_mut::<AnyObject>(),
+                createPDFWithConfiguration: config,
                 completionHandler: &*block
             ];
+            if !config.is_null() {
+                // createPDF has copied what it needs; balance the +1 from new.
+                let _: () = msg_send![config, autorelease];
+            }
         })
         .map_err(|e| e.to_string())?;
     tokio::time::timeout(std::time::Duration::from_secs(120), rx)
@@ -1360,7 +1370,7 @@ async fn render_pdf(
     let (old_w, old_h) = set_webview_frame(webview, Some(printable_w_px), None).await?;
 
     // Everything else runs inside a block so the frame/chrome ALWAYS restore.
-    let captured: Result<Meas, String> = async {
+    let captured: Result<(Meas, Vec<paginate::Segment>), String> = async {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // 2. Settle: long articles lazy-render below the fold (infinite
@@ -1371,7 +1381,7 @@ async fn render_pdf(
         //    stops moving and no images are mid-load. Bounded: ~4s worst case.
         let mut last_h = 0.0_f64;
         let mut stable = 0u32;
-        for _ in 0..14 {
+        for _ in 0..20 {
             let json = eval_js_string(webview, SETTLE_JS).await.unwrap_or_default();
             let s: Settle = serde_json::from_str(&json).unwrap_or(Settle { h: 0.0, p: 0 });
             if s.h < 1.0 {
@@ -1402,163 +1412,62 @@ async fn render_pdf(
             return Err("could not measure the page".into());
         }
 
-        // 4. Grow the frame to the full content height so createPDF captures
-        //    the entire document (usually a no-op after the settle phase),
-        //    then render.
+        // 4. Grow the frame to the full content height so the whole document
+        //    is laid out (usually a no-op after the settle phase), then
+        //    capture. Core Graphics clamps a single PDF page to 14,400 pt
+        //    (~19,200 px, ~22 US-Letter pages) and silently drops the rest —
+        //    the "long article loses its last pages" bug — so a document past
+        //    ~7,800 px is captured as several page-aligned SEGMENTS via
+        //    WKPDFConfiguration.rect instead of one giant page. Segment cuts
+        //    land exactly on output-page boundaries, so no text line can
+        //    straddle a segment edge.
         set_webview_frame(webview, None, Some(meas.h + 8.0)).await?;
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let pdf = wk_create_pdf(webview).await?;
-        std::fs::write(&raw_path, &pdf).map_err(|e| format!("write raw pdf: {e}"))?;
-        Ok(meas)
+        let tops = paginate::compute_page_tops_px(&meas, p);
+        const SEG_MAX_PX: f64 = 7800.0;
+        let seg_bounds = paginate::plan_segments(&tops, meas.h, SEG_MAX_PX);
+        let mut segments: Vec<paginate::Segment> = Vec::with_capacity(seg_bounds.len());
+        if seg_bounds.len() == 1 {
+            // Short document: the proven whole-view capture path.
+            let pdf = wk_create_pdf(webview, None).await?;
+            std::fs::write(&raw_path, &pdf).map_err(|e| format!("write raw pdf: {e}"))?;
+            segments.push(paginate::Segment { path: raw_str.clone(), top: 0.0 });
+        } else {
+            for (i, &(seg_top, seg_end)) in seg_bounds.iter().enumerate() {
+                let rect = geom::CGRect {
+                    origin: geom::CGPoint { x: 0.0, y: seg_top },
+                    size: geom::CGSize {
+                        width: meas.w,
+                        height: seg_end - seg_top,
+                    },
+                };
+                let pdf = wk_create_pdf(webview, Some(rect)).await?;
+                let seg_path = std::env::temp_dir().join(format!("wwwtopdf-raw-{i}.pdf"));
+                std::fs::write(&seg_path, &pdf)
+                    .map_err(|e| format!("write segment pdf: {e}"))?;
+                segments.push(paginate::Segment {
+                    path: seg_path.to_string_lossy().into_owned(),
+                    top: seg_top,
+                });
+            }
+        }
+        Ok((meas, segments))
     }
     .await;
 
     // 5. Restore frame and chrome (and thaw the page) regardless of outcome.
     let _ = set_webview_frame(webview, Some(old_w), Some(old_h)).await;
     let _ = webview.eval(CAPTURE_DONE_JS);
-    let meas = captured?;
+    let (meas, segments) = captured?;
 
     // 6. Paginate to US Letter at the user's margins (pure Rust).
-    paginate_tall_pdf(&raw_str, out_path, p, &meas)?;
+    let tops = paginate::compute_page_tops_px(&meas, p);
+    paginate::paginate_segments(&segments, out_path, p, &meas, &tops)?;
 
     match std::fs::metadata(out_path) {
         Ok(m) if m.len() > 0 => Ok(()),
         _ => Err("pagination produced no output".into()),
     }
-}
-
-/// Slice one tall PDF page into US-Letter pages with the given margins.
-/// Pure Rust (lopdf) and platform-independent; unit-tested by probe.
-///
-/// Geometry: the source page (width Wsrc) is drawn on each output page as a
-/// Form XObject scaled by s = content_width / Wsrc, offset so that slice k's
-/// top lands at the top of the content box, clipped to the content box. Slice
-/// boundaries snap to the nearest measured block-bottom (paragraph gap) at or
-/// above the ideal cut so text lines are never split across pages.
-fn paginate_tall_pdf(
-    src: &str,
-    dst: &str,
-    m: &Margins,
-    meas: &Meas,
-) -> Result<(), String> {
-    use lopdf::{dictionary, Document, Object, Stream};
-
-    let mut doc = Document::load(src).map_err(|e| format!("paginate: load: {e}"))?;
-    let pages = doc.get_pages();
-    let &src_id = pages.values().next().ok_or("paginate: source has no pages")?;
-
-    // Source page geometry.
-    let src_dict = doc
-        .get_dictionary(src_id)
-        .map_err(|e| e.to_string())?
-        .clone();
-    let (w_src, h_src) = match src_dict.get(b"MediaBox").and_then(|o| o.as_array()) {
-        Ok(mb) if mb.len() == 4 => {
-            let f = |o: &Object| o.as_float().unwrap_or(0.0) as f64;
-            (f(&mb[2]) - f(&mb[0]), f(&mb[3]) - f(&mb[1]))
-        }
-        _ => return Err("paginate: source page has no MediaBox".into()),
-    };
-    if w_src < 1.0 || h_src < 1.0 {
-        return Err("paginate: degenerate source page".into());
-    }
-
-    // Wrap the source page's content + resources in a Form XObject.
-    let content = doc
-        .get_page_content(src_id)
-        .map_err(|e| format!("paginate: content: {e}"))?;
-    let resources_obj = src_dict
-        .get(b"Resources")
-        .cloned()
-        .unwrap_or(Object::Dictionary(lopdf::Dictionary::new()));
-    let parent_id = src_dict
-        .get(b"Parent")
-        .and_then(|o| o.as_reference())
-        .map_err(|_| "paginate: source page has no Parent".to_string())?;
-    let form_id = doc.add_object(Stream::new(
-        dictionary! {
-            "Type" => "XObject",
-            "Subtype" => "Form",
-            "BBox" => vec![0.into(), 0.into(), w_src.into(), h_src.into()],
-            "Resources" => resources_obj,
-        },
-        content,
-    ));
-
-    // Output geometry (US Letter, points).
-    let (pw, ph) = (612.0_f64, 792.0_f64);
-    let (lm, rm) = (m.left * 72.0, m.right * 72.0);
-    let (tm, bm) = (m.top * 72.0, m.bottom * 72.0);
-    let cw = (pw - lm - rm).max(36.0);
-    let ch = (ph - tm - bm).max(36.0);
-    let s = cw / w_src;
-    // CSS px -> source pt (guards against any DPR scaling in the capture).
-    let ratio = w_src / meas.w.max(1.0);
-    let content_h = (meas.h * ratio).min(h_src).max(1.0);
-    let slice_h = ch / s; // source units per output page
-
-    // Page tops (source pt, from document top), snapped to safe breaks.
-    let breaks: Vec<f64> = meas.b.iter().map(|y| y * ratio).collect();
-    let mut tops = vec![0.0_f64];
-    let mut t = 0.0_f64;
-    while t + slice_h < content_h - 1.0 && tops.len() < 500 {
-        let ideal = t + slice_h;
-        // Largest break at/above the cut, but keep at least 40% of a page.
-        let snapped = breaks
-            .iter()
-            .copied()
-            .filter(|y| *y <= ideal - 2.0 && *y > t + slice_h * 0.4)
-            .fold(f64::NAN, f64::max);
-        let next = if snapped.is_nan() { ideal } else { snapped };
-        tops.push(next);
-        t = next;
-    }
-    let n = tops.len();
-
-    // Build the output pages.
-    let mut kids: Vec<Object> = Vec::with_capacity(n);
-    for (k, &t_k) in tops.iter().enumerate() {
-        // This page's band ends at the NEXT page's (snapped) top — and the
-        // clip must end there too, or the strip between the snapped break and
-        // the full content box shows on BOTH pages (a clipped line at the
-        // bottom of page k duplicated in full at the top of page k+1).
-        let band_end = tops
-            .get(k + 1)
-            .copied()
-            .unwrap_or_else(|| content_h.min(t_k + slice_h));
-        let clip_h = (s * (band_end - t_k)).clamp(1.0, ch);
-        let clip_y0 = (ph - tm) - clip_h;
-        // Map source band-top to the top of the content box.
-        let ty = (ph - tm) - s * (h_src - t_k);
-        let ops = format!(
-            "q {lm:.2} {clip_y0:.2} {cw:.2} {clip_h:.2} re W n {s:.6} 0 0 {s:.6} {lm:.2} {ty:.2} cm /Fm0 Do Q"
-        );
-        let cs = doc.add_object(Stream::new(dictionary! {}, ops.into_bytes()));
-        let page = doc.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => Object::Reference(parent_id),
-            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-            "Resources" => dictionary! {
-                "XObject" => dictionary! { "Fm0" => Object::Reference(form_id) },
-            },
-            "Contents" => Object::Reference(cs),
-        });
-        kids.push(Object::Reference(page));
-    }
-
-    // Swap the page tree over to the new pages.
-    let pages_dict = doc
-        .get_dictionary_mut(parent_id)
-        .map_err(|e| e.to_string())?;
-    pages_dict.set("Kids", Object::Array(kids));
-    pages_dict.set("Count", Object::Integer(n as i64));
-    pages_dict.set(
-        "MediaBox",
-        vec![0.into(), 0.into(), 612.into(), 792.into()],
-    );
-
-    doc.save(dst).map_err(|e| format!("paginate: save: {e}"))?;
-    Ok(())
 }
 
 // Non-Apple desktop (Linux/Windows) and Android have no createPDF; PDF export

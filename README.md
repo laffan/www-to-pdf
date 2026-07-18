@@ -98,12 +98,18 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   renderer (1) resizes the webview to the printable width so the live DOM
   truly reflows, (2) **settles** the page so lazy-loaded content materializes
   (below), (3) measures content height and every block element's bottom
-  edge via injected JS, (4) captures one tall exact-width PDF with
-  `WKWebView.createPDF`, and (5) slices it into US-Letter pages in pure Rust
-  (`paginate_tall_pdf`, unit-tested by probe), snapping each page break to a
-  measured **text-line boundary** (`Range.getClientRects()` gives one rect per
-  rendered line, so cuts land between lines even inside paragraphs taller
-  than a page). The webview frame and toolbar are restored after capture.
+  edge via injected JS, (4) captures exact-width PDFs with
+  `WKWebView.createPDF` — the whole view for short documents, **page-aligned
+  segments** (`WKPDFConfiguration.rect`) past ~7,800 px, because Core
+  Graphics clamps a single PDF page to 14,400 pt (the PDF 200-inch limit,
+  ~22 US-Letter pages) and silently drops everything past it — and (5)
+  slices the segments into US-Letter pages in pure Rust
+  (`src-tauri/src/paginate.rs`, unit-tested — `cargo test`), snapping each
+  page break to a measured **text-line boundary** (`Range.getClientRects()`
+  gives one rect per rendered line, so cuts land between lines even inside
+  paragraphs taller than a page; segment cuts land exactly on page
+  boundaries, so a segment edge can never split a line either). The webview
+  frame and toolbar are restored after capture.
 - **Settle (no truncation):** long articles render below the fold lazily
   (infinite scroll, `IntersectionObserver`-driven hydration, lazy images), so
   a height measured too early would capture a truncated PDF — the page looks
