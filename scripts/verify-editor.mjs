@@ -882,6 +882,112 @@ const AD_SAMPLE = `<!doctype html><html><head><title>Ads</title></head><body>
   await p.close();
 }
 
+// 23. Metadata title: as a native init script the editor evaluates at
+// document-start, BEFORE <title> is parsed — the title must be filled in at
+// mount time, not at parse time.
+{
+  const p = await browser.newPage();
+  await p.addInitScript({ content: EDITOR }); // document-start, like Tauri
+  // A real navigation (not setContent, which document.write()s and skips
+  // init scripts) so the editor genuinely evaluates before <title> parses.
+  await p.route("https://init.example/", (route) => route.fulfill({
+    status: 200, contentType: "text/html", body: SAMPLE,
+  }));
+  await p.goto("https://init.example/", { waitUntil: "load" });
+  await p.waitForSelector("#wwwpdf-panel");
+  check("meta title fills from <title> when injected at document-start", await p.evaluate(() =>
+    window.wwwToPdf.state.meta.title === "Sample Article"
+  ));
+  check("…and the Title field shows it", await p.evaluate(() =>
+    document.querySelector("#wwwpdf-metafields input").value === "Sample Article"
+  ));
+  await p.close();
+}
+
+// 24. Stacking: the metadata header carries a huge z-index so host CSS can't
+// bury it — but the Format-stage preview overlay must still cover it (the
+// "fixed header floating above the preview" bug), while panel + toast stay
+// above the overlay.
+{
+  const p = await browser.newPage();
+  await p.route("https://wwwtopdf.export/**", (route) => route.abort("aborted"));
+  await p.setContent(SAMPLE, { waitUntil: "load" });
+  await p.evaluate(() => { window.__TAURI_INTERNALS__ = {}; window.__WWWPDF_PRESETS = []; });
+  await p.addScriptTag({ content: EDITOR });
+  await p.evaluate(() =>
+    [...document.querySelectorAll("#wwwpdf-panel a")].find((a) => a.textContent === "Format").click()
+  );
+  check("preview overlay stacks above the metadata header, below the panel",
+    await p.evaluate(() => {
+      const z = (id) => parseInt(getComputedStyle(document.getElementById(id)).zIndex, 10);
+      return z("wwwpdf-preview") > z("wwwpdf-meta") && z("wwwpdf-panel") > z("wwwpdf-preview");
+    }));
+  await p.close();
+}
+
+// 25. Settle loop (extracted VERBATIM from lib.rs): lazy-loading articles
+// materialize content only when it approaches the viewport, so a single
+// early height measurement truncates the PDF. Driving the settle probe the
+// way the native loop does (measure -> grow the frame -> repeat) must pull in
+// the whole article and then detect stability.
+{
+  const librs = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const m = librs.match(/SETTLE_JS: &str = r#"([\s\S]*?)"#;/);
+  check("settle script found in lib.rs", !!m);
+  if (m) {
+    const p = await browser.newPage({ viewport: { width: 700, height: 600 } });
+    await p.setContent(`<!doctype html><html><body>
+      <div id="art"></div>
+      <script>
+        // Simulated lazy article, the common shape: N independent placeholders
+        // present from the start, each hydrating to a 500px section when it
+        // enters the viewport (IntersectionObserver). Growing the frame to the
+        // content height brings the below-the-fold placeholders into view, so
+        // they fill in — exactly what the native settle loop provokes.
+        const art = document.getElementById("art");
+        const io = new IntersectionObserver((es) => {
+          es.forEach((e) => {
+            if (e.isIntersecting && !e.target.dataset.filled) {
+              e.target.dataset.filled = "1";
+              e.target.className = "chunk";
+              e.target.style.height = "500px";
+            }
+          });
+        });
+        // Placeholders 120px tall so 13 of them (1560px) exceed the 600px
+        // viewport — the below-fold ones only hydrate once the frame grows.
+        for (let i = 0; i < 13; i++) {
+          const ph = document.createElement("div");
+          ph.style.height = "120px";
+          art.appendChild(ph);
+          io.observe(ph);
+        }
+      <\/script>
+    </body></html>`, { waitUntil: "load" });
+    let lastH = 0;
+    let stable = 0;
+    let iters = 0;
+    for (; iters < 14; iters++) {
+      const r = JSON.parse(await p.evaluate(m[1]));
+      if (Math.abs(r.h - lastH) <= 2 && r.p === 0) {
+        if (++stable >= 2) break;
+      } else {
+        stable = 0;
+      }
+      if (r.h > lastH) {
+        await p.setViewportSize({ width: 700, height: Math.min(Math.ceil(r.h) + 8, 20000) });
+      }
+      lastH = r.h;
+      await p.waitForTimeout(80);
+    }
+    const chunkCount = await p.evaluate(() => document.querySelectorAll(".chunk").length);
+    check(`settle loop materializes the whole lazy article (${chunkCount} chunks, h=${lastH})`,
+      chunkCount >= 13 && lastH >= 13 * 500);
+    check("settle loop detects stability and terminates", iters < 14);
+    await p.close();
+  }
+}
+
 await browser.close();
 
 let ok = true;

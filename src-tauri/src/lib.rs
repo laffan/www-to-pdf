@@ -379,6 +379,199 @@ async fn push_adblock_selectors(app: &tauri::AppHandle) {
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 async fn push_adblock_selectors(_app: &tauri::AppHandle) {}
 
+// ---- session persistence: cookies -------------------------------------------
+// WKWebView's website data store is persistent, but it flushes cookies to
+// disk lazily on its own schedule — log in, quit soon after, and the login is
+// gone on the next launch. Persist them explicitly, like most WKWebView apps
+// do: every finished page load (and the window-close request) snapshots the
+// cookie store to cookies.json in the app data dir; startup pushes the saved
+// cookies back into the store before the first target page loads. That's what
+// makes "log in once, capture articles on later runs" behave like a browser.
+// Session cookies (no expiry) are saved too, deliberately: restoring them is
+// exactly what keeps a site's login alive across app restarts.
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredCookie {
+    name: String,
+    value: String,
+    domain: String,
+    path: String,
+    /// unix seconds; None = session cookie
+    expires: Option<f64>,
+    secure: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn cookies_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let dir = app.path().app_data_dir().ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("cookies.json"))
+}
+
+/// Snapshot every cookie in the webview's WKHTTPCookieStore to disk.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn save_cookies(app: &tauri::AppHandle) {
+    use block2::RcBlock;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let Some(path) = cookies_path(app) else { return };
+    let Some(webview) = app.get_webview_window("main") else { return };
+    let _ = webview.with_webview(move |platform| unsafe {
+        let wk = platform.inner() as *mut AnyObject;
+        if wk.is_null() {
+            return;
+        }
+        let config: *mut AnyObject = msg_send![wk, configuration];
+        let store: *mut AnyObject = msg_send![config, websiteDataStore];
+        let cookie_store: *mut AnyObject = msg_send![store, httpCookieStore];
+        if cookie_store.is_null() {
+            return;
+        }
+        let block = RcBlock::new(move |cookies: *mut AnyObject| {
+            if cookies.is_null() {
+                return;
+            }
+            let read_str = |obj: *mut AnyObject| -> String {
+                if obj.is_null() {
+                    return String::new();
+                }
+                let utf8: *const std::os::raw::c_char = msg_send![obj, UTF8String];
+                if utf8.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                }
+            };
+            let count: usize = msg_send![cookies, count];
+            let mut out: Vec<StoredCookie> = Vec::with_capacity(count);
+            for i in 0..count {
+                let c: *mut AnyObject = msg_send![cookies, objectAtIndex: i];
+                if c.is_null() {
+                    continue;
+                }
+                let name: *mut AnyObject = msg_send![c, name];
+                let value: *mut AnyObject = msg_send![c, value];
+                let domain: *mut AnyObject = msg_send![c, domain];
+                let cpath: *mut AnyObject = msg_send![c, path];
+                let expires_date: *mut AnyObject = msg_send![c, expiresDate];
+                let expires = if expires_date.is_null() {
+                    None
+                } else {
+                    let secs: f64 = msg_send![expires_date, timeIntervalSince1970];
+                    Some(secs)
+                };
+                let secure: bool = msg_send![c, isSecure];
+                let name = read_str(name);
+                if name.is_empty() {
+                    continue;
+                }
+                out.push(StoredCookie {
+                    name,
+                    value: read_str(value),
+                    domain: read_str(domain),
+                    path: read_str(cpath),
+                    expires,
+                    secure,
+                });
+            }
+            if let Ok(json) = serde_json::to_string(&out) {
+                if std::fs::write(&path, json).is_ok() {
+                    // Auth material: keep it owner-readable only.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &path,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                    }
+                }
+            }
+        });
+        let _: () = msg_send![cookie_store, getAllCookies: &*block];
+    });
+}
+
+/// Push the saved cookies back into the webview's cookie store (startup,
+/// before the first target page loads). Expired ones are dropped here.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn restore_cookies(app: &tauri::AppHandle) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    let Some(path) = cookies_path(app) else { return };
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let Ok(saved) = serde_json::from_str::<Vec<StoredCookie>>(&text) else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let saved: Vec<StoredCookie> = saved
+        .into_iter()
+        .filter(|c| !c.name.is_empty() && c.expires.map_or(true, |e| e > now))
+        .collect();
+    if saved.is_empty() {
+        return;
+    }
+    let Some(webview) = app.get_webview_window("main") else { return };
+    let _ = webview.with_webview(move |platform| unsafe {
+        let wk = platform.inner() as *mut AnyObject;
+        if wk.is_null() {
+            return;
+        }
+        let config: *mut AnyObject = msg_send![wk, configuration];
+        let store: *mut AnyObject = msg_send![config, websiteDataStore];
+        let cookie_store: *mut AnyObject = msg_send![store, httpCookieStore];
+        if cookie_store.is_null() {
+            return;
+        }
+        let ns = |s: &str| -> *mut AnyObject {
+            let c = std::ffi::CString::new(s).unwrap_or_default();
+            msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()]
+        };
+        for ck in &saved {
+            // NSHTTPCookie property-list keys ("Name", "Value", …) are the
+            // documented plist form of NSHTTPCookieName etc.
+            let props: *mut AnyObject = msg_send![class!(NSMutableDictionary), dictionary];
+            let set = |k: &str, v: *mut AnyObject| {
+                if v.is_null() {
+                    return;
+                }
+                let key = ns(k);
+                let _: () = msg_send![props, setObject: v, forKey: key];
+            };
+            set("Name", ns(&ck.name));
+            set("Value", ns(&ck.value));
+            set("Domain", ns(&ck.domain));
+            set("Path", ns(if ck.path.is_empty() { "/" } else { &ck.path }));
+            if ck.secure {
+                set("Secure", ns("TRUE"));
+            }
+            if let Some(exp) = ck.expires {
+                let date: *mut AnyObject =
+                    msg_send![class!(NSDate), dateWithTimeIntervalSince1970: exp];
+                set("Expires", date);
+            }
+            let cookie: *mut AnyObject = msg_send![class!(NSHTTPCookie), cookieWithProperties: props];
+            if cookie.is_null() {
+                continue;
+            }
+            let _: () = msg_send![
+                cookie_store,
+                setCookie: cookie,
+                completionHandler: std::ptr::null_mut::<AnyObject>()
+            ];
+        }
+    });
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn save_cookies(_app: &tauri::AppHandle) {}
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn restore_cookies(_app: &tauri::AppHandle) {}
+
 /// Render the current webview to the preview PDF, then save or preview it.
 async fn do_export(app: tauri::AppHandle, url: Url) {
     let get = |key: &str| -> String {
@@ -804,13 +997,18 @@ fn sanitize(s: &str) -> String {
 // This pipeline controls layout directly instead:
 //   1. resize the WKWebView to the printable width (CSS px = inches * 96) so
 //      the live DOM genuinely reflows;
-//   2. injected JS hides the tool chrome and measures content height plus the
-//      bottom edge of every block element (safe page-break candidates);
-//   3. WKWebView.createPDF renders ONE tall page at exactly that width;
-//   4. paginate_tall_pdf (pure Rust, unit-tested) slices it into US-Letter
+//   2. SETTLE (page JS still live): grow the frame to the content height and
+//      re-measure until the height stabilizes and images finish, so
+//      lazy-rendered content below the fold materializes instead of being
+//      truncated; the editor's enforcement layer polices ads throughout;
+//   3. injected JS freezes the page's JS, hides the tool chrome and measures
+//      content height plus the bottom edge of every block element (safe
+//      page-break candidates);
+//   4. WKWebView.createPDF renders ONE tall page at exactly that width;
+//   5. paginate_tall_pdf (pure Rust, unit-tested) slices it into US-Letter
 //      pages at the user's margins, snapping breaks to paragraph gaps so no
 //      text line is ever split;
-//   5. the webview frame and chrome are restored.
+//   6. the webview frame and chrome are restored (and the page thawed).
 // The same createPDF/evaluateJavaScript calls exist on iOS, so this path is
 // mobile-ready.
 
@@ -920,6 +1118,40 @@ const CAPTURE_PREP_JS: &str = r#"(function(){
 /// give the page its real scheduling APIs back.
 const CAPTURE_DONE_JS: &str =
     "(function(){var s=document.getElementById('wwwpdf-capture');if(s)s.remove();if(window.wwwToPdf&&window.wwwToPdf.__captureThaw)window.wwwToPdf.__captureThaw();})()";
+
+/// Settle probe, run repeatedly (with page JS still LIVE) before the freeze:
+/// reports the current document height and how many images are still loading.
+/// The render loop grows the frame to this height — which puts the whole
+/// document "in the viewport", firing the IntersectionObservers lazy-loading
+/// sites key off — and repeats until the height stops changing and images are
+/// done, so nothing below the fold is missing from the capture.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const SETTLE_JS: &str = r#"(function(){
+  try{
+    var d=document,b=d.body,e=d.documentElement;
+    // Measure CONTENT height, not the viewport. documentElement.scrollHeight
+    // is max(content, frameHeight); since the settle loop grows the frame past
+    // the content to trigger below-fold lazy loading, reading it back would
+    // just echo the frame height and never converge. body.scrollHeight tracks
+    // the content itself. Fall back to documentElement only for the rare page
+    // that scrolls on <html> with an empty <body>.
+    var h=Math.max(b?b.scrollHeight:0,b?b.offsetHeight:0);
+    if(h<1)h=Math.max(e.scrollHeight,e.offsetHeight);
+    var pending=0,imgs=d.images;
+    for(var i=0;i<imgs.length&&i<4000;i++){if(!imgs[i].complete)pending++;}
+    return JSON.stringify({h:Math.ceil(h),p:pending});
+  }catch(err){return '{"h":0,"p":0}'}
+})()"#;
+
+/// Settle measurements reported by SETTLE_JS.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[derive(serde::Deserialize)]
+struct Settle {
+    /// full document height, CSS px
+    h: f64,
+    /// images not yet finished loading
+    p: u32,
+}
 
 /// Set the WKWebView frame size (width and/or height); returns the previous
 /// size. wry attaches the webview with an autoresizing mask, not Auto Layout
@@ -1120,21 +1352,49 @@ async fn render_pdf(
     let raw_path = std::env::temp_dir().join("wwwtopdf-raw.pdf");
     let raw_str = raw_path.to_string_lossy().into_owned();
 
-    // 0. Freeze the page's JS BEFORE the reflow below: ad slots treat the
-    //    resize as a viewport change and refresh into it, resurrecting
-    //    containers the user removed. CAPTURE_PREP_JS freezes again
-    //    (idempotently) as a belt-and-braces; CAPTURE_DONE_JS thaws.
-    let _ = webview
-        .eval("window.wwwToPdf&&window.wwwToPdf.__captureFreeze&&window.wwwToPdf.__captureFreeze()");
-
-    // 1. Reflow to print width (remember the original frame).
+    // 1. Reflow to print width (remember the original frame). Page JS stays
+    //    LIVE through the settle phase below — lazy-loaded content needs its
+    //    timers and observers to materialize; the editor's enforcement layer
+    //    keeps removed/blocked ads hidden the whole time. The freeze comes
+    //    later, inside CAPTURE_PREP_JS.
     let (old_w, old_h) = set_webview_frame(webview, Some(printable_w_px), None).await?;
 
     // Everything else runs inside a block so the frame/chrome ALWAYS restore.
     let captured: Result<Meas, String> = async {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        // 2. Hide chrome + measure (getBoundingClientRect forces fresh layout).
+        // 2. Settle: long articles lazy-render below the fold (infinite
+        //    scroll, IntersectionObserver-driven hydration, lazy images), so
+        //    a height measured too early truncates the PDF. Grow the frame to
+        //    the current content height — which puts everything "in the
+        //    viewport" and fires the observers — and repeat until the height
+        //    stops moving and no images are mid-load. Bounded: ~4s worst case.
+        let mut last_h = 0.0_f64;
+        let mut stable = 0u32;
+        for _ in 0..14 {
+            let json = eval_js_string(webview, SETTLE_JS).await.unwrap_or_default();
+            let s: Settle = serde_json::from_str(&json).unwrap_or(Settle { h: 0.0, p: 0 });
+            if s.h < 1.0 {
+                break;
+            }
+            if (s.h - last_h).abs() <= 2.0 && s.p == 0 {
+                stable += 1;
+                if stable >= 2 {
+                    break;
+                }
+            } else {
+                stable = 0;
+            }
+            if s.h > last_h {
+                set_webview_frame(webview, None, Some(s.h + 8.0)).await?;
+            }
+            last_h = s.h;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        // 3. Freeze the page (CAPTURE_PREP_JS calls __captureFreeze first, so
+        //    nothing runs between here and the capture), hide chrome, and
+        //    measure (getBoundingClientRect forces fresh layout).
         let json = eval_js_string(webview, CAPTURE_PREP_JS).await?;
         let meas: Meas =
             serde_json::from_str(&json).map_err(|e| format!("bad measurement: {e}"))?;
@@ -1142,8 +1402,9 @@ async fn render_pdf(
             return Err("could not measure the page".into());
         }
 
-        // 3. Grow the frame to the full content height so createPDF captures
-        //    the entire document, then render.
+        // 4. Grow the frame to the full content height so createPDF captures
+        //    the entire document (usually a no-op after the settle phase),
+        //    then render.
         set_webview_frame(webview, None, Some(meas.h + 8.0)).await?;
         tokio::time::sleep(Duration::from_millis(150)).await;
         let pdf = wk_create_pdf(webview).await?;
@@ -1152,12 +1413,12 @@ async fn render_pdf(
     }
     .await;
 
-    // 4. Restore frame and chrome regardless of outcome.
+    // 5. Restore frame and chrome (and thaw the page) regardless of outcome.
     let _ = set_webview_frame(webview, Some(old_w), Some(old_h)).await;
     let _ = webview.eval(CAPTURE_DONE_JS);
     let meas = captured?;
 
-    // 5. Paginate to US Letter at the user's margins (pure Rust).
+    // 6. Paginate to US Letter at the user's margins (pure Rust).
     paginate_tall_pdf(&raw_str, out_path, p, &meas)?;
 
     match std::fs::metadata(out_path) {
@@ -1354,6 +1615,9 @@ pub fn run() {
                         if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                             return;
                         }
+                        // Any finished load is a good moment to persist the
+                        // session (a login just navigated somewhere).
+                        save_cookies(&load_handle);
                         // The first page that finishes loading is our own
                         // URL-entry page; remember it as "home" so "New URL"
                         // can return here. is_home tells this page apart from a
@@ -1405,7 +1669,19 @@ pub fn run() {
             {
                 builder = builder.inner_size(1100.0, 800.0).min_inner_size(380.0, 480.0);
             }
-            builder.build()?;
+            let window = builder.build()?;
+
+            // Bring back the previous run's logins before anything remote
+            // loads, and take a final cookie snapshot when the window closes
+            // (page-load snapshots are the primary persistence; this catches
+            // a login made just before quitting).
+            restore_cookies(&handle);
+            let close_handle = handle.clone();
+            window.on_window_event(move |event| {
+                if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                    save_cookies(&close_handle);
+                }
+            });
 
             // iOS: make the webview actually fill its container and track
             // rotation / Stage-Manager resizes. wry's initial frame can be

@@ -96,13 +96,25 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   the user margins — so custom margins structurally cannot work there
   (established empirically; three experiments, all consistent). Instead the
   renderer (1) resizes the webview to the printable width so the live DOM
-  truly reflows, (2) measures content height and every block element's bottom
-  edge via injected JS, (3) captures one tall exact-width PDF with
-  `WKWebView.createPDF`, and (4) slices it into US-Letter pages in pure Rust
+  truly reflows, (2) **settles** the page so lazy-loaded content materializes
+  (below), (3) measures content height and every block element's bottom
+  edge via injected JS, (4) captures one tall exact-width PDF with
+  `WKWebView.createPDF`, and (5) slices it into US-Letter pages in pure Rust
   (`paginate_tall_pdf`, unit-tested by probe), snapping each page break to a
   measured **text-line boundary** (`Range.getClientRects()` gives one rect per
   rendered line, so cuts land between lines even inside paragraphs taller
   than a page). The webview frame and toolbar are restored after capture.
+- **Settle (no truncation):** long articles render below the fold lazily
+  (infinite scroll, `IntersectionObserver`-driven hydration, lazy images), so
+  a height measured too early would capture a truncated PDF — the page looks
+  complete in Edit but cuts off in the render. Before freezing, the renderer
+  grows the webview frame to the current content height (which brings
+  below-the-fold sections "into view" and fires their observers) and
+  re-measures, repeating until the height stops changing and images finish —
+  bounded to ~4s. Content height is read from `body.scrollHeight`, **not**
+  `documentElement.scrollHeight`: the latter is `max(content, frameHeight)`,
+  and since we deliberately grow the frame past the content, reading it back
+  would just echo the frame and never converge.
 - **Headers/footers/page numbers:** WebKit has no CSS running headers or
   `@page` counters, so they're stamped onto the finished PDF in Rust
   (`lopdf`) — drawn in the margin bands in 9pt Helvetica. Pure Rust, so the
@@ -153,6 +165,15 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   link (the `wwwtopdf.adblock` sentinel) for ad units that load late. The web
   build — and a native first run while offline — falls back to a small
   built-in list of unambiguous ad selectors.
+- **Session persistence (stay logged in):** WKWebView keeps a persistent
+  website data store, but flushes cookies to disk on its own lazy schedule —
+  log in, quit soon after, and the login is gone next launch. So the app
+  snapshots the cookie store to `cookies.json` (app data dir, `0600`) on every
+  finished page load and on window close, and pushes the saved cookies back
+  into the store at startup before the first target page loads. Session
+  cookies are kept too — restoring them is what keeps a login alive across
+  restarts — so "log in once, capture articles on later runs" behaves like a
+  normal browser. Auth material never leaves the device.
 - **Stage 4 save:** a native save dialog (`tauri-plugin-dialog`); the chosen
   location receives a *copy of the previewed file*, so the saved PDF is
   byte-identical to what was on screen. On iOS the same button hands the file

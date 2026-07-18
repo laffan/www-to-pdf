@@ -1387,7 +1387,9 @@
       ov = el("div", {
         id: NS + "-preview",
         style:
-          "position:fixed;inset:0;z-index:2147483640;background:#3f3f46;" +
+          // Above the metadata header (2147483645) — which otherwise floats
+          // over the preview — but below the panel and toast (2147483647).
+          "position:fixed;inset:0;z-index:2147483646;background:#3f3f46;" +
           "overflow:auto;-webkit-overflow-scrolling:touch;padding:28px 0",
       });
       ov.appendChild(
@@ -1566,6 +1568,10 @@
         state.meta[k] = options.meta[k];
       });
     }
+    // As a native init script this file evaluates at document-start, before
+    // <title> is parsed — so the parse-time default is always "". Fill it in
+    // now (mount runs at DOMContentLoaded, when the title exists).
+    if (!state.meta.title) state.meta.title = document.title || "";
     ensureStyle();
     ensureSafeAreaViewport();
     renderMeta();
