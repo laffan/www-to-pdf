@@ -137,13 +137,19 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   unit-tested): the paginated document is a single flat page tree, so trimming
   is a rebuild of its `Kids`. A blank or all-covering range is a no-op.
 - **archive.is mode:** paywalled or framing-blocked articles can be routed
-  through archive.is from the Edit pane. Checking the box navigates the webview
-  (via the same `wwwtopdf.load` native-load sentinel the URL entry uses) to
-  `archive.is/submit/?url=…` for the current page; the user clears archive.is's
-  bot check, then **Extract Content** promotes the snapshot's `#CONTENT`
-  element to the top of the body and removes every other node except the tool's
-  own chrome, recovering the original URL for the metadata header. From there
-  it's a normal edit → format → save.
+  through archive.is from the Edit pane. Rather than hand-craft a submit URL
+  (archive.is is finicky about how the request is made), the editor drives the
+  site's own form: checking the box navigates the webview to the archive.is
+  home page, carrying the article URL in the location fragment; on arrival the
+  editor fills that page's `#submiturl` form and clicks **save**, exactly as a
+  person would, so archive.is runs its normal submit + bot-check flow. The
+  webview also presents a real Safari user-agent (`WEBVIEW_UA`), without which
+  archive.is serves embedded webviews an endless challenge. Once the user
+  clears the bot check, the snapshot loads with the article inside a `#CONTENT`
+  div, and **Extract Content** unwraps it — lifting `#CONTENT`'s children into
+  `<body>` and discarding the wrapper (and its styling) along with the rest of
+  the archive.is chrome, recovering the original URL for the metadata header.
+  From there it's a normal edit → format → save.
 - **Removal presets:** each clicked removal records a durable CSS selector
   (nearest sane id, else `tag.stable-classes` path; build-hashed class names
   are skipped). The toolbar shows a dropdown (a preset auto-applies on

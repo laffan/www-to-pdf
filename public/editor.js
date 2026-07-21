@@ -788,24 +788,26 @@
   // ---- archive.is mode (native) ---------------------------------------------
   // Route the current article through archive.is, which renders a static,
   // paywall-free snapshot of pages that otherwise block framing / need a login.
-  // Checking the box navigates this webview (via the same native-load sentinel
-  // as the URL-entry page) to archive.is's submit endpoint for the current URL.
-  // archive.is answers with a bot check; once the user clears it the snapshot
-  // loads with its article inside a #CONTENT div. "Extract Content" lifts that
-  // div to the top of the page and drops archive.is's own chrome, so the result
-  // edits and exports exactly like any other page.
+  // Rather than hand-craft a submit URL (fragile — archive.is is picky about how
+  // the request is made), we drive its own form: checking the box navigates the
+  // webview to the archive.is home page, carrying this article's URL in the
+  // location fragment. There the editor fills the page's #submiturl form and
+  // clicks "save" — exactly what a person would do — so archive.is runs its
+  // normal submit + bot-check flow. Once the user clears the bot check the
+  // snapshot loads with its article inside a #CONTENT div, and "Extract Content"
+  // lifts that content out so it edits and exports like any other page.
   var ARCHIVE_HOST_RE = /(^|\.)archive\.(is|today|ph|li|md|vn|fo|ec)$/i;
+  var ARCHIVE_HOME = "https://archive.is/";
+  // Fragment key that carries the article URL from the article page to the
+  // archive.is home page (survives the cross-origin navigation; the server
+  // ignores it, the editor there reads it back).
+  var ARCHIVE_FRAG = "wwwpdf=";
   function onArchivePage() {
     try {
       return ARCHIVE_HOST_RE.test(location.hostname);
     } catch (e) {
       return false;
     }
-  }
-  // https://example.com/x  ->
-  // https://archive.is/submit/?url=https%3A%2F%2Farchive.is%2Fhttps%3A%2F%2Fexample.com%2Fx
-  function archiveSubmitUrl(u) {
-    return "https://archive.is/submit/?url=" + encodeURIComponent("https://archive.is/" + u);
   }
   // Recover the original article URL from an archive.is location so metadata can
   // point at the source, not the snapshot. Snapshot URLs embed it after the id
@@ -856,6 +858,52 @@
     toast("Content extracted — remove anything extra, then continue to Format.");
     refreshArchiveUI();
   }
+  // On the archive.is home page (reached by checking archive.is mode) fill the
+  // submit form with the article URL carried in the location fragment and click
+  // "save" — the same path as doing it by hand, so archive.is runs its normal
+  // submit + bot-check flow. The form is static markup on the home page, but
+  // poll briefly in case it's a beat late. One-shot: once submitted the GET form
+  // navigates away (dropping the fragment), and the guard blocks a re-fire.
+  var _archiveSubmitted = false;
+  function startArchiveAutofill() {
+    if (_archiveSubmitted || !onArchivePage()) return;
+    var hash = location.hash || "";
+    var at = hash.indexOf(ARCHIVE_FRAG);
+    if (at < 0) return;
+    var target;
+    try {
+      target = decodeURIComponent(hash.slice(at + ARCHIVE_FRAG.length));
+    } catch (e) {
+      target = hash.slice(at + ARCHIVE_FRAG.length);
+    }
+    if (!/^https?:\/\//i.test(target)) return;
+    var tries = 0;
+    (function attempt() {
+      if (_archiveSubmitted) return;
+      var form = document.getElementById("submiturl");
+      var input =
+        document.getElementById("url") ||
+        (form && form.querySelector('input[name="url"]'));
+      if (!form && input) form = input.form;
+      if (form && input) {
+        _archiveSubmitted = true;
+        input.value = target;
+        // Let any archive.is field listeners see the value before we submit.
+        try {
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+        } catch (e) {}
+        toast("Submitting to archive.is…");
+        var save = form.querySelector('input[type="submit"],button[type="submit"]');
+        if (save) save.click();
+        else if (typeof form.submit === "function") form.submit();
+        return;
+      }
+      if (tries++ < 20) setTimeout(attempt, 250);
+      else toast("Couldn't find the archive.is form — paste the URL and press save.");
+    })();
+  }
+
   // Rebound to the real updater when the panel is built.
   var refreshArchiveUI = function () {};
   function buildArchive() {
@@ -864,12 +912,14 @@
       class: CLS_CHECK,
       onchange: function (e) {
         if (e.target.checked) {
-          if (onArchivePage()) return; // already on a snapshot
+          if (onArchivePage()) return; // already on archive.is
           toast("Opening archive.is…");
-          // Navigate straight to archive.is — it has no companion app to hijack
-          // the link, and a direct navigation hands over the submit URL byte for
-          // byte, without the wwwtopdf.load sentinel's extra encode/decode hop.
-          window.location.href = archiveSubmitUrl(location.href);
+          // Go to the archive.is home page and carry this article's URL in the
+          // fragment; the editor there fills the submit form and clicks save
+          // (see startArchiveAutofill). Direct navigation — archive.is has no
+          // companion app to hijack the link.
+          window.location.href =
+            ARCHIVE_HOME + "#" + ARCHIVE_FRAG + encodeURIComponent(location.href);
         } else if (onArchivePage()) {
           // Un-checking on a snapshot returns to the original article. That page
           // may have an installed app, so route it through the native-load
@@ -1745,6 +1795,8 @@
       setAdblockSelectors(pushed || BUILTIN_AD_SELECTORS, pushed ? "engine" : "builtin");
     }
     ensureEnforcer();
+    // If we arrived on archive.is from a mode toggle, fill its form and submit.
+    startArchiveAutofill();
     window.wwwToPdf.__mounted = true;
     return window.wwwToPdf;
   }
