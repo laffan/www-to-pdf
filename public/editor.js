@@ -708,6 +708,7 @@
   function buildAdblock(isNative) {
     var cb = el("input", {
       type: "checkbox",
+      style: STYLE_CHECK,
       onchange: function (e) {
         state.adblock.userChoice = e.target.checked;
         state.adblock.enabled = e.target.checked && state.adblock.selectors.length > 0;
@@ -844,6 +845,7 @@
   function buildArchive() {
     var cb = el("input", {
       type: "checkbox",
+      style: STYLE_CHECK,
       onchange: function (e) {
         if (e.target.checked) {
           if (onArchivePage()) return; // already on a snapshot
@@ -889,6 +891,11 @@
   var STYLE_PRIMARY =
     "appearance:none;border:0;background:#111;color:#fff;border-radius:8px;" +
     "padding:11px 12px;font:600 14px system-ui,sans-serif;cursor:pointer;width:100%";
+  // Checkboxes live inside display:flex labels. WebKit (WKWebView) will shrink a
+  // replaced flex item with no explicit size down toward zero width — the box
+  // then reads as "no checkbox at all." Pin the size and forbid shrinking so the
+  // control renders identically on every engine.
+  var STYLE_CHECK = "width:16px;height:16px;flex:none;margin:0;accent-color:#111;cursor:pointer";
 
   function buildPanel() {
     var isNative = !!window.__TAURI_INTERNALS__;
@@ -968,6 +975,7 @@
       [
         el("input", {
           type: "checkbox",
+          style: STYLE_CHECK,
           onchange: function (e) {
             state.meta.show = e.target.checked;
             metaFields.style.display = e.target.checked ? "grid" : "none";
@@ -1080,6 +1088,7 @@
       [
         el("input", {
           type: "checkbox",
+          style: STYLE_CHECK,
           onchange: function (e) {
             state.marginGuide = e.target.checked;
             render_style();
@@ -1116,6 +1125,7 @@
       [
         el("input", {
           type: "checkbox",
+          style: STYLE_CHECK,
           onchange: function (e) { state.pageNumbers = e.target.checked; },
         }),
         el("span", {}, ["Page numbers"]),
