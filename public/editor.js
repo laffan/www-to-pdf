@@ -31,13 +31,13 @@
     // Identify-content section. Each of header/body/author keeps a LIST of
     // signatures the user grows/shrinks with +/- pick modes; every element a
     // list matches is tagged NS-<cat>. The body list drives the Format sliders;
-    // onlyIdentified isolates the PDF to just the tagged content. `mode` is the
-    // active pick mode ('body+', 'header-', …) or null.
+    // `extract` rebuilds the PDF from just the tagged content. `mode` is the
+    // active pick mode ('body+', 'header-', 'author1', …) or null.
     identify: {
       enabled: false,
       mode: null,
-      onlyIdentified: false,
-      sigs: { header: [], body: [], author: [] },
+      extract: false,
+      sigs: { header: [], author: [], date: [], body: [] },
     },
     bodyPx: null,       // null = untouched
     lineHeight: null,   // null = untouched
@@ -123,7 +123,8 @@
       idOn && !state.previewMode
         ? "." + NS + "-body{background-color:rgba(37,99,235,.16)!important}" +
           "." + NS + "-header{background-color:rgba(16,185,129,.18)!important}" +
-          "." + NS + "-author{background-color:rgba(245,158,11,.22)!important}"
+          "." + NS + "-author{background-color:rgba(245,158,11,.22)!important}" +
+          "." + NS + "-date{background-color:rgba(168,85,247,.20)!important}"
         : "";
     var hs = state.headingScale;
     var headRule =
@@ -176,7 +177,7 @@
       "@media print{",
       "  #" + NS + "-panel,#" + NS + "-panel *,#" + NS + "-toast{display:none!important}",
       "  ." + NS + "-removed{display:none!important}",
-      "  ." + NS + "-body,." + NS + "-header,." + NS + "-author{background:transparent!important}",
+      "  ." + NS + "-body,." + NS + "-header,." + NS + "-author,." + NS + "-date{background:transparent!important}",
       "  html::after{display:none!important}",
       "  #" + NS + "-meta{display:" + (state.meta.show ? "block" : "none") + "!important}",
       "}",
@@ -271,10 +272,12 @@
     t.classList.remove(NS + "-hi");
     var mode = state.identify.mode;
     if (mode) {
-      var cat = mode.slice(0, -1); // header | body | author
-      if (mode.slice(-1) === "+") addSignature(cat, t);
-      else removeSignature(cat, t);
-      return; // stay in the mode so the user can keep picking
+      var cat = mode.slice(0, -1); // header | author | date | body
+      var op = mode.slice(-1);
+      if (op === "+") addSignature(cat, t);
+      else if (op === "-") removeSignature(cat, t);
+      else { setSingleSignature(cat, t); setIdentifyPickMode(null); } // toggle cats: one pick
+      return; // +/- modes stay active for more picks
     }
     // Remove mode: record a durable selector + prior inline display for Undo.
     state.removed.push({ el: t, sel: cssPath(t), prev: hideNode(t) });
@@ -288,7 +291,8 @@
   // signature to a category; "-" drops any signature in that category that
   // matches the clicked element. Every element a list matches is tagged
   // NS-<cat>, which the sliders, washes and content isolation key off.
-  var CATS = ["header", "body", "author"];
+  // Order matters: it drives both the panel rows and the extraction order.
+  var CATS = ["header", "author", "date", "body"];
   function signatureFor(node) {
     var tag = node.localName;
     var cls = stableClasses(node); // letter-ish, non-namespaced classes
@@ -337,12 +341,22 @@
         cat + " — " + n + " left."
     );
   }
+  // Single-element categories (author, date): one specific element, not a broad
+  // signature. A precise cssPath keeps the match to just that node.
+  function setSingleSignature(cat, node) {
+    if (!node || node.nodeType !== 1 || panelContains(node)) return;
+    var sel = cssPath(node);
+    state.identify.sigs[cat] = [
+      sel ? { sel: sel } : { tag: node.localName, style: node.getAttribute("style") || "" },
+    ];
+    reapplyIdentified();
+    toast(cat + " set.");
+  }
   function isIdentified(el) {
-    return (
-      el.classList.contains(NS + "-header") ||
-      el.classList.contains(NS + "-body") ||
-      el.classList.contains(NS + "-author")
-    );
+    for (var i = 0; i < CATS.length; i++) {
+      if (el.classList.contains(NS + "-" + CATS[i])) return true;
+    }
+    return false;
   }
   // Re-mark the page from the signature lists (clear every mark, then re-add).
   function reapplyIdentified() {
@@ -414,53 +428,108 @@
     });
     _bodyFont = null;
   }
-  // "Only use identified content": hide everything that is neither identified
-  // nor an ancestor of identified content (nor our own chrome). Identified
-  // subtrees render in place; their non-identified siblings vanish. Reversible.
-  var _isolated = null; // [{el, v, p}]
-  function applyOnlyIdentified() {
-    if (_isolated || typeof Set === "undefined") return;
-    _isolated = [];
-    var keep = new Set();
-    CATS.forEach(function (cat) {
-      var marked = document.getElementsByClassName(NS + "-" + cat);
-      for (var i = 0; i < marked.length; i++) {
-        var p = marked[i].parentElement;
-        while (p && p !== document.body) { keep.add(p); p = p.parentElement; }
-      }
-    });
-    (function walk(parent) {
-      var kids = parent.children;
-      for (var i = 0; i < kids.length; i++) {
-        var el = kids[i];
-        if (el.id && el.id.indexOf(NS) === 0) continue; // our chrome
-        if (isIdentified(el)) continue;                 // keep identified subtree
-        if (keep.has(el)) { walk(el); continue; }        // ancestor: keep + recurse
-        _isolated.push({
-          el: el,
-          v: el.style.getPropertyValue("display"),
-          p: el.style.getPropertyPriority("display"),
-        });
-        el.style.setProperty("display", "none", "important");
-      }
-    })(document.body);
+  // "Extract identified content": scrap the page's own markup and rebuild it as
+  // a clean structure containing just the identified header / author / date /
+  // body (in that order), preserving only the font. Each piece is a cloned copy
+  // with all styling/classes stripped, then the computed font re-applied — body
+  // clones keep the NS-body class so the sliders drive them; the others keep
+  // their own size/weight. The originals are hidden and the page background /
+  // text colour neutralised so the result reads cleanly on paper. Reversible.
+  function stripAll(node) {
+    if (!node || node.nodeType !== 1) return;
+    node.removeAttribute("style");
+    node.removeAttribute("class");
+    node.removeAttribute("id");
+    node.removeAttribute("width");
+    node.removeAttribute("height");
+    node.removeAttribute("align");
+    var kids = node.children;
+    for (var i = 0; i < kids.length; i++) stripAll(kids[i]);
   }
-  function restoreOnlyIdentified() {
-    if (!_isolated) return;
-    _isolated.forEach(function (r) {
+  function cleanClone(src, cat) {
+    var cs = null;
+    try { cs = getComputedStyle(src); } catch (e) {}
+    var clone = src.cloneNode(true);
+    stripAll(clone);
+    if (cat === "body") {
+      clone.classList.add(NS + "-body"); // sliders drive size + line-height
+      if (cs) clone.style.setProperty("font-family", cs.fontFamily);
+      clone.style.setProperty("margin", "0 0 1em");
+    } else if (cs) {
+      clone.style.setProperty("font-family", cs.fontFamily);
+      clone.style.setProperty("font-size", cs.fontSize);
+      clone.style.setProperty("font-weight", cs.fontWeight);
+      clone.style.setProperty("font-style", cs.fontStyle);
+      clone.style.setProperty("line-height", cs.lineHeight);
+      clone.style.setProperty("margin", cat === "header" ? "0 0 .15em" : "0 0 .1em");
+    }
+    return clone;
+  }
+  var _extracted = null; // { container, hidden:[{el,v,p}], body:{bg,color} }
+  function applyExtract() {
+    if (_extracted) return;
+    var container = el("div", {
+      id: NS + "-extracted",
+      style:
+        "color:#111!important;background:transparent!important;max-width:none!important;" +
+        "position:relative!important;z-index:1!important;font-family:inherit",
+    });
+    CATS.forEach(function (cat) {
+      Array.prototype.slice
+        .call(document.getElementsByClassName(NS + "-" + cat))
+        .forEach(function (src) {
+          if (panelContains(src)) return;
+          container.appendChild(cleanClone(src, cat));
+        });
+    });
+    // Nothing identified — don't blank the page.
+    if (!container.children.length) return;
+    _extracted = { container: container, hidden: [], body: {} };
+    Array.prototype.slice.call(document.body.children).forEach(function (child) {
+      if (child.id && child.id.indexOf(NS) === 0) return; // keep our chrome
+      _extracted.hidden.push({
+        el: child,
+        v: child.style.getPropertyValue("display"),
+        p: child.style.getPropertyPriority("display"),
+      });
+      child.style.setProperty("display", "none", "important");
+    });
+    // Neutralise the page's own background/text colour so the clean content
+    // reads on white paper (dark-theme sites would otherwise bleed through).
+    _extracted.body.bg = {
+      v: document.body.style.getPropertyValue("background-color"),
+      p: document.body.style.getPropertyPriority("background-color"),
+    };
+    _extracted.body.color = {
+      v: document.body.style.getPropertyValue("color"),
+      p: document.body.style.getPropertyPriority("color"),
+    };
+    document.body.style.setProperty("background-color", "#fff", "important");
+    document.body.style.setProperty("color", "#111", "important");
+    document.body.appendChild(container);
+  }
+  function restoreExtract() {
+    if (!_extracted) return;
+    if (_extracted.container.parentNode) _extracted.container.remove();
+    _extracted.hidden.forEach(function (r) {
       if (r.v) r.el.style.setProperty("display", r.v, r.p);
       else r.el.style.removeProperty("display");
     });
-    _isolated = null;
+    var b = _extracted.body;
+    if (b.bg.v) document.body.style.setProperty("background-color", b.bg.v, b.bg.p);
+    else document.body.style.removeProperty("background-color");
+    if (b.color.v) document.body.style.setProperty("color", b.color.v, b.color.p);
+    else document.body.style.removeProperty("color");
+    _extracted = null;
   }
   // Toggle the identify-content effects on the live DOM (called by showPane as
   // the user moves between Edit and Format).
   function applyIdentifyForFormat(on) {
     if (on && state.identify.enabled) {
-      if (state.identify.sigs.body.length) stripBodyFontSizes();
-      if (state.identify.onlyIdentified) applyOnlyIdentified();
+      if (state.identify.extract) applyExtract();
+      else if (state.identify.sigs.body.length) stripBodyFontSizes();
     } else {
-      restoreOnlyIdentified();
+      restoreExtract();
       restoreBodyFontSizes();
     }
   }
@@ -1184,14 +1253,24 @@
     return el("div", {}, [label, extractBtn, hint]);
   }
 
-  // Identify-content section (native). Collapsed behind an enable checkbox;
-  // when on, reveals +/- pick buttons for Header / Body / Author and the
-  // "Only use identified content" switch. No list is shown — the +/- modes and
-  // the on-page washes are the whole interface.
+  // Identify-content section (native). Collapsed behind an enable checkbox; when
+  // on, reveals pick controls for Header / Author / Date / Body and the "Extract
+  // identified content" switch. Header and Body use +/- (a signature list you
+  // grow and shrink); Author and Date are single-element toggles. No list is
+  // shown — the controls and the on-page washes are the whole interface.
   function buildIdentify() {
     var tools = el("div", { style: "display:none;margin-top:8px" });
 
-    function catRow(labelText, cat) {
+    // A category row: `controls` is the right-hand control cluster.
+    function row(labelText, controls) {
+      return el(
+        "div",
+        { style: "display:flex;align-items:center;justify-content:space-between;gap:8px;margin:5px 0" },
+        [el("span", { style: "font-weight:600;font-size:12px" }, [labelText]), controls]
+      );
+    }
+    // +/- pair (Header, Body).
+    function plusMinus(cat, labelText) {
       function pickBtn(op) {
         var b = el("button", {
           style: PICK_BTN,
@@ -1205,36 +1284,49 @@
         b.setAttribute("data-mode", cat + op);
         return b;
       }
-      return el(
-        "div",
-        { style: "display:flex;align-items:center;justify-content:space-between;gap:8px;margin:5px 0" },
-        [
-          el("span", { style: "font-weight:600;font-size:12px" }, [labelText]),
-          el("div", { style: "display:flex;gap:6px" }, [pickBtn("+"), pickBtn("-")]),
-        ]
-      );
+      return el("div", { style: "display:flex;gap:6px" }, [pickBtn("+"), pickBtn("-")]);
     }
-    tools.appendChild(catRow("Header", "header"));
-    tools.appendChild(catRow("Body", "body"));
-    tools.appendChild(catRow("Author", "author"));
+    // Single-select toggle (Author, Date): pick one element, or clear it.
+    function toggle(cat, labelText) {
+      var b = el("button", {
+        style: PICK_TOG,
+        title: "Click, then click the " + labelText.toLowerCase() + " on the page",
+        onclick: function () {
+          var mode = cat + "1";
+          if (state.identify.mode === mode) { setIdentifyPickMode(null); return; }
+          if (state.identify.sigs[cat].length) { // already set — clear it
+            state.identify.sigs[cat] = [];
+            reapplyIdentified();
+            return;
+          }
+          setIdentifyPickMode(mode);
+        },
+      }, ["Select"]);
+      b.setAttribute("data-mode", cat + "1");
+      return b;
+    }
+    tools.appendChild(row("Header", plusMinus("header", "Header")));
+    tools.appendChild(row("Author", toggle("author", "Author")));
+    tools.appendChild(row("Date", toggle("date", "Date")));
+    tools.appendChild(row("Body", plusMinus("body", "Body")));
 
-    var onlyCb = el("input", {
+    var extractCb = el("input", {
       type: "checkbox",
       class: CLS_CHECK,
-      onchange: function (e) { state.identify.onlyIdentified = e.target.checked; },
+      onchange: function (e) { state.identify.extract = e.target.checked; },
     });
     tools.appendChild(
       el(
         "label",
         { style: "display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:8px;font-size:12px;color:#52525b" },
-        [onlyCb, el("span", {}, ["Only use identified content"])]
+        [extractCb, el("span", {}, ["Extract identified content"])]
       )
     );
     tools.appendChild(
       el(
         "div",
         { style: "font-size:11px;color:#71717a;margin-top:6px" },
-        ["Pick +/− then click text on the page. Tinted while editing; the Body sliders resize what you mark."]
+        ["Pick a control, then click text on the page. Tinted while editing; the Body sliders resize what you mark."]
       )
     );
 
@@ -1254,12 +1346,21 @@
       [enableCb, el("span", { style: "font-weight:600" }, ["Identify content"])]
     );
 
-    // Reflect the active pick mode on the +/- buttons.
+    // Reflect the active pick mode / identified state on the controls.
     refreshIdentifyUI = function () {
       var mode = state.identify.mode;
       Array.prototype.forEach.call(tools.querySelectorAll("button[data-mode]"), function (b) {
-        var active = b.getAttribute("data-mode") === mode;
-        b.style.cssText = active ? PICK_BTN_ON : PICK_BTN;
+        var dm = b.getAttribute("data-mode");
+        var cat = dm.slice(0, -1);
+        var op = dm.slice(-1);
+        var active = dm === mode;
+        if (op === "1") {
+          var has = state.identify.sigs[cat].length > 0;
+          b.style.cssText = active || has ? PICK_TOG_ON : PICK_TOG;
+          b.textContent = active ? "Click it…" : has ? "Selected ✓" : "Select";
+        } else {
+          b.style.cssText = active ? PICK_BTN_ON : PICK_BTN;
+        }
         b.setAttribute("aria-pressed", active ? "true" : "false");
       });
     };
@@ -1280,13 +1381,20 @@
   // a custom bordered box (see render_style) so they're always visible and can't
   // be shrunk or hidden by the host page or the webview's native rendering.
   var CLS_CHECK = NS + "-check";
-  // Small square +/- toggle buttons used by the identify-content section.
+  // Small square +/- buttons and wider single-select toggles for the
+  // identify-content section.
   var PICK_BTN =
     "appearance:none;border:1px solid #d4d4d8;background:#fff;color:#18181b;border-radius:6px;" +
     "width:30px;height:26px;font:600 15px system-ui;line-height:1;padding:0;cursor:pointer";
   var PICK_BTN_ON =
     "appearance:none;border:1px solid #111;background:#111;color:#fff;border-radius:6px;" +
     "width:30px;height:26px;font:600 15px system-ui;line-height:1;padding:0;cursor:pointer";
+  var PICK_TOG =
+    "appearance:none;border:1px solid #d4d4d8;background:#fff;color:#18181b;border-radius:6px;" +
+    "min-width:66px;height:26px;font:600 12px system-ui;line-height:1;padding:0 10px;cursor:pointer";
+  var PICK_TOG_ON =
+    "appearance:none;border:1px solid #111;background:#111;color:#fff;border-radius:6px;" +
+    "min-width:66px;height:26px;font:600 12px system-ui;line-height:1;padding:0 10px;cursor:pointer";
 
   function buildPanel() {
     var isNative = !!window.__TAURI_INTERNALS__;
@@ -1633,9 +1741,9 @@
     paneEdit.appendChild(removeRow);
     paneEdit.appendChild(count);
     paneEdit.appendChild(sep());
-    paneEdit.appendChild(archiveUI);
-    paneEdit.appendChild(sep());
     paneEdit.appendChild(adblockUI);
+    paneEdit.appendChild(sep());
+    paneEdit.appendChild(archiveUI);
     paneEdit.appendChild(sep());
     paneEdit.appendChild(identifyUI);
     paneEdit.appendChild(sep());

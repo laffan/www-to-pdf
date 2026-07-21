@@ -132,20 +132,26 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   same code will serve iOS.
 - **Identify content:** the Body / Line-height sliders resize a generic
   selector (`body, p, li, …`) by default, which misfires on div-based layouts.
-  The **Identify content** section (Edit pane) reveals **+ / −** pick buttons
-  for **Header / Body / Author** plus an **Only use identified content** switch.
-  Each category holds a LIST of signatures the user grows/shrinks by clicking
-  text: a signature is a SIMPLE descriptor (tag + stable classes, or a semantic
-  text tag) when the element offers one, else the tag plus its exact `style`
-  attribute. Every matched element is tagged `NS-<cat>`; the Body sliders then
-  target `NS-body`, and each category gets a distinct confirmation wash shown
-  only while editing (never in the PDF). Two things happen on the way into
-  Format so the formatter actually has control: inline `font-size` is stripped
-  off the body elements **and their descendants** (nested spans were defeating
-  the slider), and — when **Only use identified content** is on — everything
-  that isn't identified (or an ancestor of identified content) is hidden, so the
-  PDF carries just the header/body/author. Both effects are reversible and undo
-  themselves on the way back to Edit.
+  The **Identify content** section (Edit pane) reveals controls for **Header /
+  Author / Date / Body**: Header and Body use **+ / −** (a signature LIST you
+  grow and shrink — a signature is a tag + stable classes, a semantic text tag,
+  or the tag plus its exact `style` attribute), while Author and Date are
+  single-element **toggles** (one specific node, matched by a precise
+  `cssPath`). Every match is tagged `NS-<cat>`; the Body sliders target
+  `NS-body`, and each category gets a distinct confirmation wash shown only
+  while editing (never in the PDF). On the way into Format:
+  - inline `font-size` is stripped off the identified body **and its
+    descendants** (nested spans were defeating the slider) so `NS-body`'s rule
+    wins; and
+  - if **Extract identified content** is on, the page's own markup is scrapped
+    and rebuilt as a clean structure of just the identified header → author →
+    date → body, in that order — each a cloned copy with all styling/classes
+    stripped and **only the computed font re-applied** (body clones keep
+    `NS-body` so the sliders drive them). The originals are hidden and the page
+    background/text colour neutralised so it reads on white paper.
+
+  Both effects apply to the live DOM the renderer captures and undo themselves
+  on the way back to Edit.
 - **Page range:** a printer-style range from the Format pane (e.g. `1-3, 5`)
   rides the export sentinel and, after pagination, trims the PDF to just those
   pages before the header/footer stamp runs — so page numbers count the
