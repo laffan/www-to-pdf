@@ -28,12 +28,17 @@
   var state = {
     removeMode: false,
     removed: [],        // stack of {el, prev} for undo
-    // Body-text identification. The Body/Line-height sliders target a generic
-    // selector by default (often wrong on div-based layouts); "Identify Body"
-    // lets the user click real body text so we mark every matching block with
-    // the NS-body class and point the sliders at that instead.
-    identifyMode: false,
-    bodyIdentified: false,
+    // Identify-content section. Each of header/body/author keeps a LIST of
+    // signatures the user grows/shrinks with +/- pick modes; every element a
+    // list matches is tagged NS-<cat>. The body list drives the Format sliders;
+    // onlyIdentified isolates the PDF to just the tagged content. `mode` is the
+    // active pick mode ('body+', 'header-', …) or null.
+    identify: {
+      enabled: false,
+      mode: null,
+      onlyIdentified: false,
+      sigs: { header: [], body: [], author: [] },
+    },
     bodyPx: null,       // null = untouched
     lineHeight: null,   // null = untouched
     headingScale: 1,
@@ -104,17 +109,21 @@
     var bodyDecl = "";
     if (state.bodyPx) bodyDecl += "font-size:" + state.bodyPx + "px !important;";
     if (state.lineHeight) bodyDecl += "line-height:" + state.lineHeight + " !important;";
-    // Once the user has identified body text, the sliders drive exactly that
-    // set (marked with NS-body); otherwise fall back to the generic heuristic.
-    var bodyTargets = state.bodyIdentified
-      ? "." + NS + "-body"
-      : "body, p, li, td, th, blockquote, dd, dt";
+    // Once body text is identified, the sliders drive exactly that set (marked
+    // with NS-body); otherwise fall back to the generic heuristic.
+    var idOn = state.identify.enabled;
+    var bodyTargets =
+      idOn && state.identify.sigs.body.length
+        ? "." + NS + "-body"
+        : "body, p, li, td, th, blockquote, dd, dt";
     var bodyRule = bodyDecl ? bodyTargets + " {" + bodyDecl + "}" : "";
-    // Light-blue confirmation wash over the identified body text — shown only
-    // while editing, never in the Format preview or the exported PDF.
-    var bodyHiRule =
-      state.bodyIdentified && !state.previewMode
-        ? "." + NS + "-body{background-color:rgba(37,99,235,.18)!important}"
+    // Confirmation washes over identified content (header/body/author) — shown
+    // only while editing, never in the Format preview or the exported PDF.
+    var washRule =
+      idOn && !state.previewMode
+        ? "." + NS + "-body{background-color:rgba(37,99,235,.16)!important}" +
+          "." + NS + "-header{background-color:rgba(16,185,129,.18)!important}" +
+          "." + NS + "-author{background-color:rgba(245,158,11,.22)!important}"
         : "";
     var hs = state.headingScale;
     var headRule =
@@ -160,14 +169,14 @@
         "left:5px!important;top:2px!important;width:3px!important;height:7px!important;box-sizing:content-box!important;" +
         "border:solid #fff!important;border-width:0 2px 2px 0!important;transform:rotate(45deg)!important;background:none!important}",
       bodyRule,
-      bodyHiRule,
+      washRule,
       hs !== 1 ? headRule : "",
       guideRule,
       // The tool's own chrome must never appear in the exported PDF.
       "@media print{",
       "  #" + NS + "-panel,#" + NS + "-panel *,#" + NS + "-toast{display:none!important}",
       "  ." + NS + "-removed{display:none!important}",
-      "  ." + NS + "-body{background:transparent!important}",
+      "  ." + NS + "-body,." + NS + "-header,." + NS + "-author{background:transparent!important}",
       "  html::after{display:none!important}",
       "  #" + NS + "-meta{display:" + (state.meta.show ? "block" : "none") + "!important}",
       "}",
@@ -233,12 +242,17 @@
     render_style();
   }
 
-  // ---- remove mode / identify mode -----------------------------------------
-  // Both modes share the same click-to-pick affordance (crosshair + hover
-  // outline); the active mode decides what a click does.
+  // ---- remove mode / identify-content pick modes ---------------------------
+  // Remove mode and the identify pick modes share the same click-to-pick
+  // affordance (crosshair + hover outline); the active mode decides what a click
+  // does. state.identify.mode is 'header+','header-','body+','body-','author+',
+  // 'author-' (category + add/remove) or null.
   var hovered = null;
+  function inPickMode() {
+    return state.removeMode || !!state.identify.mode;
+  }
   function onOver(e) {
-    if (!state.removeMode && !state.identifyMode) return;
+    if (!inPickMode()) return;
     if (panelContains(e.target)) return;
     if (hovered) hovered.classList.remove(NS + "-hi");
     hovered = e.target;
@@ -249,102 +263,206 @@
     hovered = null;
   }
   function onClick(e) {
-    if (!state.removeMode && !state.identifyMode) return;
+    if (!inPickMode()) return;
     if (panelContains(e.target)) return;
     e.preventDefault();
     e.stopPropagation();
     var t = e.target;
     t.classList.remove(NS + "-hi");
-    if (state.identifyMode) {
-      identifyBodyFrom(t);
-      setIdentifyMode(false);
-      return;
+    var mode = state.identify.mode;
+    if (mode) {
+      var cat = mode.slice(0, -1); // header | body | author
+      if (mode.slice(-1) === "+") addSignature(cat, t);
+      else removeSignature(cat, t);
+      return; // stay in the mode so the user can keep picking
     }
-    // Record a durable selector alongside the node so the removal set can be
-    // saved as a preset and replayed on a fresh load of a similar page, and
-    // the node's prior inline display so Undo can restore it exactly.
+    // Remove mode: record a durable selector + prior inline display for Undo.
     state.removed.push({ el: t, sel: cssPath(t), prev: hideNode(t) });
     updateCounts();
   }
 
-  // ---- body-text identification --------------------------------------------
-  // The Format sliders (body size, line height) need to know which elements ARE
-  // body text. The generic selector guesses wrong on div-based layouts, so let
-  // the user point at a real paragraph. We first look for a SIMPLE descriptor —
-  // the element's tag plus any stable classes (or a semantic text tag on its
-  // own); if there isn't one (e.g. a bare <div> styled only by its style
-  // attribute), we fall back to treating that style attribute as a SIGNATURE
-  // and match every same-tag element carrying the identical style. Matches are
-  // marked with the NS-body class, which the sliders and the on-screen wash key
-  // off.
-  function simpleBodySelector(node) {
+  // ---- identify content (header / author / body) ---------------------------
+  // Each category keeps a LIST of signatures. A signature is a SIMPLE selector
+  // (tag + stable classes, or a semantic text tag) when the element offers one,
+  // else the tag plus its exact style attribute. "+" adds the clicked element's
+  // signature to a category; "-" drops any signature in that category that
+  // matches the clicked element. Every element a list matches is tagged
+  // NS-<cat>, which the sliders, washes and content isolation key off.
+  var CATS = ["header", "body", "author"];
+  function signatureFor(node) {
     var tag = node.localName;
     var cls = stableClasses(node); // letter-ish, non-namespaced classes
-    if (cls.length) return tag + "." + cls.join(".");
-    if (tag === "p" || tag === "li" || tag === "blockquote") return tag;
-    return null; // no clean descriptor — caller falls back to the signature
+    if (cls.length) return { sel: tag + "." + cls.join(".") };
+    if (/^(p|li|blockquote|h[1-6]|figcaption)$/.test(tag)) return { sel: tag };
+    return { tag: tag, style: node.getAttribute("style") || "" };
   }
-  function clearBodyMarks() {
-    var marked = document.getElementsByClassName(NS + "-body");
-    // Live collection — iterate from the end while removing.
-    for (var i = marked.length - 1; i >= 0; i--) marked[i].classList.remove(NS + "-body");
-    state.bodyIdentified = false;
-  }
-  function identifyBodyFrom(target) {
-    if (!target || target.nodeType !== 1) return;
-    clearBodyMarks();
-    var matched = [];
-    var sel = simpleBodySelector(target);
-    if (sel) {
+  function matchSignature(sig) {
+    if (sig.sel) {
       try {
-        matched = Array.prototype.slice.call(document.querySelectorAll(sel));
+        return Array.prototype.slice.call(document.querySelectorAll(sig.sel));
       } catch (e) {
-        matched = [];
+        return [];
       }
     }
-    var how = "style";
-    if (matched.length) {
-      how = sel;
-    } else {
-      // Signature fallback: same tag + identical style attribute.
-      var sig = target.getAttribute("style") || "";
-      var tag = target.localName;
-      matched = Array.prototype.filter.call(
-        document.getElementsByTagName(tag),
-        function (n) {
-          return (n.getAttribute("style") || "") === sig;
-        }
-      );
-      how = tag + "[style]";
-    }
-    if (!matched.length) matched = [target];
-    matched.forEach(function (n) {
-      if (panelContains(n)) return;
-      n.classList.add(NS + "-body");
-    });
-    state.bodyIdentified = true;
-    render_style();
-    updateBodyBtn();
-    toast(
-      "Body text identified — " + matched.length + " block" +
-        (matched.length === 1 ? "" : "s") + " (matched by " + how + ")."
+    return Array.prototype.filter.call(
+      document.getElementsByTagName(sig.tag),
+      function (n) {
+        return (n.getAttribute("style") || "") === sig.style;
+      }
     );
   }
-  function setIdentifyMode(on) {
-    state.identifyMode = on;
-    if (on) setRemoveMode(false); // the two picking modes are exclusive
-    updateBodyBtn();
-    if (!on) onOut();
+  function sigKey(sig) {
+    return sig.sel ? "s:" + sig.sel : "a:" + sig.tag + "|" + sig.style;
   }
-  function updateBodyBtn() {
-    var btn = document.getElementById(NS + "-bodybtn");
-    if (!btn) return;
-    btn.setAttribute("aria-pressed", state.identifyMode);
-    btn.textContent = state.identifyMode
-      ? "● Click your body text"
-      : state.bodyIdentified
-      ? "Identify Body ✓"
-      : "Identify Body";
+  function addSignature(cat, node) {
+    if (!node || node.nodeType !== 1 || panelContains(node)) return;
+    var sig = signatureFor(node);
+    var key = sigKey(sig);
+    var list = state.identify.sigs[cat];
+    if (!list.some(function (s) { return sigKey(s) === key; })) list.push(sig);
+    reapplyIdentified();
+    var n = document.getElementsByClassName(NS + "-" + cat).length;
+    toast(cat + ": " + n + " block" + (n === 1 ? "" : "s") + " identified.");
+  }
+  function removeSignature(cat, node) {
+    var list = state.identify.sigs[cat];
+    var before = list.length;
+    state.identify.sigs[cat] = list.filter(function (sig) {
+      return matchSignature(sig).indexOf(node) < 0; // keep sigs that don't hit this node
+    });
+    reapplyIdentified();
+    var n = document.getElementsByClassName(NS + "-" + cat).length;
+    toast(
+      (state.identify.sigs[cat].length < before ? "Removed from " : "Not in ") +
+        cat + " — " + n + " left."
+    );
+  }
+  function isIdentified(el) {
+    return (
+      el.classList.contains(NS + "-header") ||
+      el.classList.contains(NS + "-body") ||
+      el.classList.contains(NS + "-author")
+    );
+  }
+  // Re-mark the page from the signature lists (clear every mark, then re-add).
+  function reapplyIdentified() {
+    CATS.forEach(function (cat) {
+      var marked = document.getElementsByClassName(NS + "-" + cat);
+      for (var i = marked.length - 1; i >= 0; i--) {
+        marked[i].classList.remove(NS + "-" + cat);
+      }
+    });
+    CATS.forEach(function (cat) {
+      state.identify.sigs[cat].forEach(function (sig) {
+        matchSignature(sig).forEach(function (n) {
+          if (panelContains(n)) return;
+          if (n === document.body || n === document.documentElement) return;
+          n.classList.add(NS + "-" + cat);
+        });
+      });
+    });
+    render_style();
+    refreshIdentifyUI();
+  }
+  // Rebound to the real button-state updater when the panel is built.
+  var refreshIdentifyUI = function () {};
+  function setIdentifyPickMode(mode) {
+    state.identify.mode = mode || null;
+    if (state.identify.mode && state.removeMode) {
+      state.removeMode = false;
+      var rb = document.getElementById(NS + "-removebtn");
+      if (rb) { rb.setAttribute("aria-pressed", "false"); rb.textContent = "Remove elements"; }
+    }
+    refreshIdentifyUI();
+    if (!state.identify.mode) onOut();
+  }
+
+  // ---- identify-content effects applied to the DOM the renderer captures ----
+  // When entering Format we hand the identified body to the formatter with real
+  // control: strip inline font-size off body elements AND their descendants
+  // (nested spans often carry the size that defeated the slider). Reversible so
+  // Edit shows the page unaltered.
+  var _bodyFont = null; // [{el, v, p}]
+  function stripBodyFontSizes() {
+    if (_bodyFont) return;
+    _bodyFont = [];
+    var seen = typeof Set !== "undefined" ? new Set() : null;
+    function strip(el) {
+      if (!el || el.nodeType !== 1) return;
+      if (seen) { if (seen.has(el)) return; seen.add(el); }
+      if (el.style && el.style.getPropertyValue("font-size")) {
+        _bodyFont.push({
+          el: el,
+          v: el.style.getPropertyValue("font-size"),
+          p: el.style.getPropertyPriority("font-size"),
+        });
+        el.style.removeProperty("font-size");
+      }
+    }
+    Array.prototype.slice
+      .call(document.getElementsByClassName(NS + "-body"))
+      .forEach(function (b) {
+        strip(b);
+        var kids = b.querySelectorAll("[style]");
+        for (var i = 0; i < kids.length; i++) strip(kids[i]);
+      });
+  }
+  function restoreBodyFontSizes() {
+    if (!_bodyFont) return;
+    _bodyFont.forEach(function (r) {
+      try { r.el.style.setProperty("font-size", r.v, r.p); } catch (e) {}
+    });
+    _bodyFont = null;
+  }
+  // "Only use identified content": hide everything that is neither identified
+  // nor an ancestor of identified content (nor our own chrome). Identified
+  // subtrees render in place; their non-identified siblings vanish. Reversible.
+  var _isolated = null; // [{el, v, p}]
+  function applyOnlyIdentified() {
+    if (_isolated || typeof Set === "undefined") return;
+    _isolated = [];
+    var keep = new Set();
+    CATS.forEach(function (cat) {
+      var marked = document.getElementsByClassName(NS + "-" + cat);
+      for (var i = 0; i < marked.length; i++) {
+        var p = marked[i].parentElement;
+        while (p && p !== document.body) { keep.add(p); p = p.parentElement; }
+      }
+    });
+    (function walk(parent) {
+      var kids = parent.children;
+      for (var i = 0; i < kids.length; i++) {
+        var el = kids[i];
+        if (el.id && el.id.indexOf(NS) === 0) continue; // our chrome
+        if (isIdentified(el)) continue;                 // keep identified subtree
+        if (keep.has(el)) { walk(el); continue; }        // ancestor: keep + recurse
+        _isolated.push({
+          el: el,
+          v: el.style.getPropertyValue("display"),
+          p: el.style.getPropertyPriority("display"),
+        });
+        el.style.setProperty("display", "none", "important");
+      }
+    })(document.body);
+  }
+  function restoreOnlyIdentified() {
+    if (!_isolated) return;
+    _isolated.forEach(function (r) {
+      if (r.v) r.el.style.setProperty("display", r.v, r.p);
+      else r.el.style.removeProperty("display");
+    });
+    _isolated = null;
+  }
+  // Toggle the identify-content effects on the live DOM (called by showPane as
+  // the user moves between Edit and Format).
+  function applyIdentifyForFormat(on) {
+    if (on && state.identify.enabled) {
+      if (state.identify.sigs.body.length) stripBodyFontSizes();
+      if (state.identify.onlyIdentified) applyOnlyIdentified();
+    } else {
+      restoreOnlyIdentified();
+      restoreBodyFontSizes();
+    }
   }
   function panelContains(node) {
     var p = document.getElementById(NS + "-panel");
@@ -352,10 +470,10 @@
   }
   function setRemoveMode(on) {
     state.removeMode = on;
-    if (on && state.identifyMode) {
-      // The two picking modes are exclusive; drop identify without recursing.
-      state.identifyMode = false;
-      updateBodyBtn();
+    if (on && state.identify.mode) {
+      // The picking modes are exclusive; drop the identify mode without recursing.
+      state.identify.mode = null;
+      refreshIdentifyUI();
     }
     // The button may not be in the document yet (initial showPane runs while
     // the panel is still being built); default text/aria already match `off`.
@@ -1066,6 +1184,90 @@
     return el("div", {}, [label, extractBtn, hint]);
   }
 
+  // Identify-content section (native). Collapsed behind an enable checkbox;
+  // when on, reveals +/- pick buttons for Header / Body / Author and the
+  // "Only use identified content" switch. No list is shown — the +/- modes and
+  // the on-page washes are the whole interface.
+  function buildIdentify() {
+    var tools = el("div", { style: "display:none;margin-top:8px" });
+
+    function catRow(labelText, cat) {
+      function pickBtn(op) {
+        var b = el("button", {
+          style: PICK_BTN,
+          title: (op === "+" ? "Add to " : "Remove from ") + labelText.toLowerCase() +
+            " — then click text on the page",
+          onclick: function () {
+            var mode = cat + op;
+            setIdentifyPickMode(state.identify.mode === mode ? null : mode);
+          },
+        }, [op === "+" ? "+" : "−"]);
+        b.setAttribute("data-mode", cat + op);
+        return b;
+      }
+      return el(
+        "div",
+        { style: "display:flex;align-items:center;justify-content:space-between;gap:8px;margin:5px 0" },
+        [
+          el("span", { style: "font-weight:600;font-size:12px" }, [labelText]),
+          el("div", { style: "display:flex;gap:6px" }, [pickBtn("+"), pickBtn("-")]),
+        ]
+      );
+    }
+    tools.appendChild(catRow("Header", "header"));
+    tools.appendChild(catRow("Body", "body"));
+    tools.appendChild(catRow("Author", "author"));
+
+    var onlyCb = el("input", {
+      type: "checkbox",
+      class: CLS_CHECK,
+      onchange: function (e) { state.identify.onlyIdentified = e.target.checked; },
+    });
+    tools.appendChild(
+      el(
+        "label",
+        { style: "display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:8px;font-size:12px;color:#52525b" },
+        [onlyCb, el("span", {}, ["Only use identified content"])]
+      )
+    );
+    tools.appendChild(
+      el(
+        "div",
+        { style: "font-size:11px;color:#71717a;margin-top:6px" },
+        ["Pick +/− then click text on the page. Tinted while editing; the Body sliders resize what you mark."]
+      )
+    );
+
+    var enableCb = el("input", {
+      type: "checkbox",
+      class: CLS_CHECK,
+      onchange: function (e) {
+        state.identify.enabled = e.target.checked;
+        tools.style.display = e.target.checked ? "block" : "none";
+        if (!e.target.checked) setIdentifyPickMode(null);
+        render_style(); // washes / slider target follow the enable state
+      },
+    });
+    var enableLabel = el(
+      "label",
+      { style: "display:flex;align-items:center;gap:8px;cursor:pointer;padding:2px 0" },
+      [enableCb, el("span", { style: "font-weight:600" }, ["Identify content"])]
+    );
+
+    // Reflect the active pick mode on the +/- buttons.
+    refreshIdentifyUI = function () {
+      var mode = state.identify.mode;
+      Array.prototype.forEach.call(tools.querySelectorAll("button[data-mode]"), function (b) {
+        var active = b.getAttribute("data-mode") === mode;
+        b.style.cssText = active ? PICK_BTN_ON : PICK_BTN;
+        b.setAttribute("aria-pressed", active ? "true" : "false");
+      });
+    };
+    refreshIdentifyUI();
+
+    return el("div", {}, [enableLabel, tools]);
+  }
+
   // ---- panel UI ------------------------------------------------------------
   var STYLE_BTN =
     "appearance:none;border:1px solid #d4d4d8;background:#fff;color:#18181b;" +
@@ -1078,6 +1280,13 @@
   // a custom bordered box (see render_style) so they're always visible and can't
   // be shrunk or hidden by the host page or the webview's native rendering.
   var CLS_CHECK = NS + "-check";
+  // Small square +/- toggle buttons used by the identify-content section.
+  var PICK_BTN =
+    "appearance:none;border:1px solid #d4d4d8;background:#fff;color:#18181b;border-radius:6px;" +
+    "width:30px;height:26px;font:600 15px system-ui;line-height:1;padding:0;cursor:pointer";
+  var PICK_BTN_ON =
+    "appearance:none;border:1px solid #111;background:#111;color:#fff;border-radius:6px;" +
+    "width:30px;height:26px;font:600 15px system-ui;line-height:1;padding:0;cursor:pointer";
 
   function buildPanel() {
     var isNative = !!window.__TAURI_INTERNALS__;
@@ -1391,27 +1600,23 @@
       paneEdit.style.display = editing ? "" : "none";
       paneFormat.style.display = editing ? "none" : "";
       if (editing) setRemoveMode(false);
-      else setIdentifyMode(false);
+      else setIdentifyPickMode(null);
       cEdit.style.cssText = "font-size:12px;text-decoration:none;cursor:pointer;" + (editing ? CRUMB_ON : CRUMB_OFF);
       cFormat.style.cssText = "font-size:12px;text-decoration:none;cursor:pointer;" + (editing ? CRUMB_OFF : CRUMB_ON);
       // The Format stage shows the real rendered PDF inline; Edit hides it so
       // the live page is interactive again for logging in / removing clutter.
       state.previewMode = !editing;
-      // Re-render so the body-text wash (Edit-only) turns off in Format and the
-      // rendered PDF never carries it.
+      // Hand the identified content to the formatter on the way into Format
+      // (strip inline body font-sizes, isolate if "only identified"); undo it
+      // on the way back. Then re-render so the Edit-only washes toggle too.
+      applyIdentifyForFormat(!editing);
       render_style();
       if (editing) closePreview();
       else openPreview();
       panel.scrollTop = 0;
     }
 
-    var bodyBtn = el("button", {
-      id: NS + "-bodybtn",
-      style: STYLE_BTN,
-      "aria-pressed": "false",
-      title: "Click a paragraph so the Format sliders resize the right text",
-      onclick: function () { setIdentifyMode(!state.identifyMode); },
-    }, ["Identify Body"]);
+    var identifyUI = buildIdentify();
     var nextBtn = el("button", {
       style: STYLE_PRIMARY, onclick: function () { showPane("format"); },
     }, ["Next: Format →"]);
@@ -1432,10 +1637,10 @@
     paneEdit.appendChild(sep());
     paneEdit.appendChild(adblockUI);
     paneEdit.appendChild(sep());
+    paneEdit.appendChild(identifyUI);
+    paneEdit.appendChild(sep());
     paneEdit.appendChild(presetsUI);
     paneEdit.appendChild(sep());
-    paneEdit.appendChild(bodyBtn);
-    paneEdit.appendChild(el("div", { style: "height:6px" }));
     paneEdit.appendChild(nextBtn);
 
     // Pane 2 (Format)
