@@ -831,22 +831,24 @@
       toast("No archived content yet — clear the bot check and let the snapshot load, then try again.");
       return;
     }
-    // Promote #CONTENT and drop every other top-level node, keeping only our own
-    // toolbar / preview / metadata / style (ids prefixed with the namespace).
-    document.body.insertBefore(content, document.body.firstChild);
-    Array.prototype.slice.call(document.body.children).forEach(function (child) {
-      if (child === content) return;
-      if (child.id && child.id.indexOf(NS) === 0) return;
-      child.remove();
+    // We want what's INSIDE #CONTENT, not the wrapper — #CONTENT carries
+    // archive.is layout styling (and any `#CONTENT …` descendant rules) we
+    // don't want. So lift its child nodes out and make them the body, then
+    // discard #CONTENT along with all the other archive.is chrome. Grab the
+    // children first (as references), since the next step detaches #CONTENT.
+    var inner = Array.prototype.slice.call(content.childNodes);
+    // Drop every existing top-level node except our own toolbar / preview /
+    // metadata / toast (ids prefixed with the namespace). This removes
+    // #CONTENT and its wrapper subtree too.
+    Array.prototype.slice.call(document.body.childNodes).forEach(function (node) {
+      if (node.nodeType === 1 && node.id && node.id.indexOf(NS) === 0) return;
+      node.remove();
     });
-    // archive.is positions its content wrapper; neutralize that so it flows
-    // normally down the printable column.
-    try {
-      content.style.setProperty("position", "static", "important");
-      content.style.setProperty("float", "none", "important");
-      content.style.setProperty("margin", "0 auto", "important");
-      content.style.setProperty("max-width", "none", "important");
-    } catch (e) {}
+    // Re-home the article's own nodes as direct children of <body>. appendChild
+    // moves each node out of the (now detached) #CONTENT wrapper.
+    inner.forEach(function (node) {
+      document.body.appendChild(node);
+    });
     var orig = originalFromArchive();
     if (orig) state.meta.url = orig;
     if (!state.meta.title) state.meta.title = document.title || "";
