@@ -470,6 +470,17 @@
     var cs = null;
     try { cs = getComputedStyle(src); } catch (e) {}
     var clone = src.cloneNode(true);
+    if (cat === "body") {
+      // A body block often wraps the title/byline/date. Those are emitted in
+      // the masthead already, so drop any header/author/date nodes from inside
+      // the body clone — otherwise the title doubles (once styled in the
+      // masthead, once style-stripped here). The clone still carries the marks.
+      CATS.forEach(function (c) {
+        if (c === "body") return;
+        var dup = clone.querySelectorAll("." + NS + "-" + c);
+        for (var i = 0; i < dup.length; i++) dup[i].remove();
+      });
+    }
     stripAll(clone);
     if (cat === "body") {
       clone.classList.add(NS + "-body"); // sliders drive size + line-height

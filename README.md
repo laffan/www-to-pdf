@@ -224,15 +224,21 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   link (the `wwwtopdf.adblock` sentinel) for ad units that load late. The web
   build — and a native first run while offline — falls back to a small
   built-in list of unambiguous ad selectors.
-- **Session persistence (stay logged in):** WKWebView keeps a persistent
-  website data store, but flushes cookies to disk on its own lazy schedule —
-  log in, quit soon after, and the login is gone next launch. So the app
-  snapshots the cookie store to `cookies.json` (app data dir, `0600`) on every
-  finished page load and on window close, and pushes the saved cookies back
-  into the store at startup before the first target page loads. Session
-  cookies are kept too — restoring them is what keeps a login alive across
-  restarts — so "log in once, capture articles on later runs" behaves like a
-  normal browser. Auth material never leaves the device.
+- **Session persistence (stay logged in):** the webview runs with a
+  **non-persistent (incognito) data store** — on purpose: a persistent store
+  makes WKWebView write a "WebCrypto Master Key" to the login keychain, which
+  macOS then prompts to unlock on every launch (worse under dev builds, whose
+  changing code signature invalidates the item each rebuild). A non-persistent
+  store never creates it. Because nothing persists on its own, the app manages
+  the two things it *wants* to keep, itself: it snapshots the cookie store to
+  `cookies.json` (app data dir, `0600`) on every finished page load and on
+  window close and pushes the saved cookies back into the store at startup
+  before the first target page loads (session cookies included — that's what
+  keeps a login alive), and it keeps the **recent list** in `history.json`
+  (Rust records each entered URL and captured title, and pushes the list into
+  the URL-entry page on load) rather than the webview's localStorage. So "log
+  in once, capture articles on later runs" still behaves like a normal browser,
+  with no keychain prompt. Auth material never leaves the device.
 - **Stage 4 save:** a native save dialog (`tauri-plugin-dialog`); the chosen
   location receives a *copy of the previewed file*, so the saved PDF is
   byte-identical to what was on screen. On iOS the same button hands the file

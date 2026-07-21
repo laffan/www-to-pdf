@@ -83,6 +83,20 @@ function setHistoryTitle(url, title) {
 // Called from Rust (app) via eval on the main window.
 window.__wwwpdfSetHistoryTitle = setHistoryTitle;
 
+// Replace the whole recent list from Rust's persisted store. In the native app
+// the webview runs with a non-persistent data store (so it never writes a
+// WebCrypto key to the keychain), which means this page's localStorage doesn't
+// survive a restart — Rust owns the durable recents and pushes them here on load.
+function setHistory(list) {
+  if (!Array.isArray(list)) return;
+  const clean = list
+    .map((e) => (typeof e === "string" ? { u: e, t: "" } : e))
+    .filter((e) => e && e.u);
+  writeHistory(clean);
+  renderHistory();
+}
+window.__wwwpdfSetHistory = setHistory;
+
 function renderHistory() {
   const list = $("history");
   if (!list) return;

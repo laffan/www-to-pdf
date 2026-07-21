@@ -96,6 +96,99 @@ fn presets_json_for_js(presets: &[Preset]) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
+// ---- recent-list persistence -----------------------------------------------
+// The webview runs incognito (no keychain-backed WebCrypto), so its localStorage
+// doesn't survive a restart. Rust keeps the recents in history.json instead and
+// pushes them into the app page when it loads.
+
+/// A recent-list entry: the entered URL and (once known) the page title.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct HistItem {
+    u: String,
+    #[serde(default)]
+    t: String,
+}
+
+fn history_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let dir = app.path().app_data_dir().ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("history.json"))
+}
+
+fn load_history(app: &tauri::AppHandle) -> Vec<HistItem> {
+    history_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn store_history(app: &tauri::AppHandle, items: &[HistItem]) {
+    if let Some(p) = history_path(app) {
+        if let Ok(json) = serde_json::to_string_pretty(items) {
+            let _ = std::fs::write(p, json);
+        }
+    }
+}
+
+fn history_json_for_js(items: &[HistItem]) -> String {
+    serde_json::to_string(items)
+        .unwrap_or_else(|_| "[]".into())
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Record a freshly entered URL at the front of the recent list (dedup, cap 8),
+/// keeping any title already known for it, and persist.
+fn record_history(app: &tauri::AppHandle, url: &str) {
+    let state = app.state::<AppState>();
+    let snapshot = {
+        let mut hist = state.history.lock().unwrap();
+        let prior = hist
+            .iter()
+            .find(|h| h.u == url)
+            .map(|h| h.t.clone())
+            .unwrap_or_default();
+        hist.retain(|h| h.u != url);
+        hist.insert(0, HistItem { u: url.to_string(), t: prior });
+        hist.truncate(8);
+        hist.clone()
+    };
+    store_history(app, &snapshot);
+}
+
+/// Attach a captured title to its recent-list entry and persist. (Only the
+/// Apple title-capture path calls this; other targets have no title capture.)
+#[allow(dead_code)]
+fn set_history_title(app: &tauri::AppHandle, url: &str, title: &str) {
+    let state = app.state::<AppState>();
+    let snapshot = {
+        let mut hist = state.history.lock().unwrap();
+        let mut changed = false;
+        for h in hist.iter_mut() {
+            if h.u == url && h.t != title {
+                h.t = title.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        hist.clone()
+    };
+    store_history(app, &snapshot);
+}
+
+/// Push the full recent list into the app (URL-entry) page.
+fn push_history(app: &tauri::AppHandle) {
+    let items = app.state::<AppState>().history.lock().unwrap().clone();
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.eval(&format!(
+            "window.__wwwpdfSetHistory&&window.__wwwpdfSetHistory({})",
+            history_json_for_js(&items)
+        ));
+    }
+}
+
 /// Handle a preset save/delete sentinel navigation, then push the updated
 /// list (and a toast) back into the toolbar via eval.
 fn handle_preset_nav(app: &tauri::AppHandle, url: &Url) {
@@ -180,6 +273,11 @@ struct AppState {
     // recent list when it next loads (the target page is a different origin, so
     // it can't write the app's localStorage itself).
     titles: Mutex<std::collections::HashMap<String, String>>,
+    // The recent-list, persisted here rather than in the webview's localStorage:
+    // the webview runs with a non-persistent (incognito) data store so it never
+    // writes a WebCrypto master key to the keychain, which would otherwise
+    // prompt on every launch. Rust owns the durable recents instead.
+    history: Mutex<Vec<HistItem>>,
     // The Bushido-style ad-block engine. Built once, in the background, at app
     // start (EasyList parse takes a beat); None until then and when the list
     // can neither be read from cache nor downloaded.
@@ -258,6 +356,7 @@ fn handle_sentinel(app: &tauri::AppHandle, nav_url: &Url) -> bool {
                 .map(|(_, v)| v.into_owned())
             {
                 *app.state::<AppState>().pending.lock().unwrap() = Some(target.clone());
+                record_history(app, &target);
                 if let Ok(u) = Url::parse(&target) {
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
@@ -309,7 +408,8 @@ fn capture_history_title(app: &tauri::AppHandle) {
                         .titles
                         .lock()
                         .unwrap()
-                        .insert(key, t);
+                        .insert(key.clone(), t.clone());
+                    set_history_title(&app, &key, &t);
                 }
             }
         }
@@ -1534,6 +1634,13 @@ pub fn run() {
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Prepare source")
                     .user_agent(WEBVIEW_UA)
+                    // Non-persistent (incognito) data store: WKWebView then never
+                    // writes a "WebCrypto Master Key" to the login keychain, so
+                    // macOS stops prompting for it on every launch. Logins still
+                    // persist — cookies are snapshotted to cookies.json and
+                    // restored at startup — and the recent list is kept by Rust
+                    // (history.json) rather than the webview's localStorage.
+                    .incognito(true)
                     .initialization_script(init)
                     .on_navigation(move |url| !handle_sentinel(&nav_handle, url))
                     .on_page_load(move |_wv, payload| {
@@ -1565,8 +1672,11 @@ pub fn run() {
                             ));
                         }
                         if is_home {
-                            // Back on the URL-entry page: fill the recent list
-                            // with the titles captured from visited pages.
+                            // Back on the URL-entry page: restore the persisted
+                            // recent list (localStorage is gone under the
+                            // non-persistent data store), then top up any titles
+                            // captured this session.
+                            push_history(&load_handle);
                             push_history_titles(&load_handle);
                         } else {
                             // A target site finished loading: record its title.
@@ -1595,6 +1705,10 @@ pub fn run() {
                 builder = builder.inner_size(1100.0, 800.0).min_inner_size(380.0, 480.0);
             }
             let window = builder.build()?;
+
+            // Load the persisted recent list into memory (pushed to the app
+            // page when it finishes loading, above).
+            *handle.state::<AppState>().history.lock().unwrap() = load_history(&handle);
 
             // Bring back the previous run's logins before anything remote
             // loads, and take a final cookie snapshot when the window closes
