@@ -45,6 +45,17 @@ const PRESET_HOST: &str = "wwwtopdf.preset"; // ?action=save|update|delete…
 const LOAD_HOST: &str = "wwwtopdf.load"; // ?url=… -> native WKWebView load
 const ADBLOCK_HOST: &str = "wwwtopdf.adblock"; // ?action=refresh -> recompute ad filters
 
+// A real Safari user-agent for the webview. WKWebView's default UA omits the
+// "Version/x Safari/x" tokens, so it reads as a bare embedded WebKit client —
+// which sites like archive.today treat hostilely, serving an endless challenge
+// or a blank page that never resolves (it loads fine in Safari with the same
+// URL). Presenting a standard Safari UA makes remote sites serve us the normal
+// experience. Desktop UA on macOS, mobile Safari UA on iOS.
+#[cfg(not(target_os = "ios"))]
+const WEBVIEW_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15";
+#[cfg(target_os = "ios")]
+const WEBVIEW_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+
 /// A saved removal set: CSS selectors recorded when elements were clicked,
 /// replayable on any page with similar markup. Stored in the app data dir;
 /// injected into the target webview alongside the editor at load time.
@@ -1522,6 +1533,7 @@ pub fn run() {
             let mut builder =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Prepare source")
+                    .user_agent(WEBVIEW_UA)
                     .initialization_script(init)
                     .on_navigation(move |url| !handle_sentinel(&nav_handle, url))
                     .on_page_load(move |_wv, payload| {
