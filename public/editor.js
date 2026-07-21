@@ -28,6 +28,12 @@
   var state = {
     removeMode: false,
     removed: [],        // stack of {el, prev} for undo
+    // Body-text identification. The Body/Line-height sliders target a generic
+    // selector by default (often wrong on div-based layouts); "Identify Body"
+    // lets the user click real body text so we mark every matching block with
+    // the NS-body class and point the sliders at that instead.
+    identifyMode: false,
+    bodyIdentified: false,
     bodyPx: null,       // null = untouched
     lineHeight: null,   // null = untouched
     headingScale: 1,
@@ -98,9 +104,18 @@
     var bodyDecl = "";
     if (state.bodyPx) bodyDecl += "font-size:" + state.bodyPx + "px !important;";
     if (state.lineHeight) bodyDecl += "line-height:" + state.lineHeight + " !important;";
-    var bodyRule = bodyDecl
-      ? "body, p, li, td, th, blockquote, dd, dt {" + bodyDecl + "}"
-      : "";
+    // Once the user has identified body text, the sliders drive exactly that
+    // set (marked with NS-body); otherwise fall back to the generic heuristic.
+    var bodyTargets = state.bodyIdentified
+      ? "." + NS + "-body"
+      : "body, p, li, td, th, blockquote, dd, dt";
+    var bodyRule = bodyDecl ? bodyTargets + " {" + bodyDecl + "}" : "";
+    // Light-blue confirmation wash over the identified body text — shown only
+    // while editing, never in the Format preview or the exported PDF.
+    var bodyHiRule =
+      state.bodyIdentified && !state.previewMode
+        ? "." + NS + "-body{background-color:rgba(37,99,235,.18)!important}"
+        : "";
     var hs = state.headingScale;
     var headRule =
       "h1{font-size:calc(2.0em*" + hs + ")!important}" +
@@ -145,12 +160,14 @@
         "left:5px!important;top:2px!important;width:3px!important;height:7px!important;box-sizing:content-box!important;" +
         "border:solid #fff!important;border-width:0 2px 2px 0!important;transform:rotate(45deg)!important;background:none!important}",
       bodyRule,
+      bodyHiRule,
       hs !== 1 ? headRule : "",
       guideRule,
       // The tool's own chrome must never appear in the exported PDF.
       "@media print{",
       "  #" + NS + "-panel,#" + NS + "-panel *,#" + NS + "-toast{display:none!important}",
       "  ." + NS + "-removed{display:none!important}",
+      "  ." + NS + "-body{background:transparent!important}",
       "  html::after{display:none!important}",
       "  #" + NS + "-meta{display:" + (state.meta.show ? "block" : "none") + "!important}",
       "}",
@@ -216,10 +233,12 @@
     render_style();
   }
 
-  // ---- remove mode ---------------------------------------------------------
+  // ---- remove mode / identify mode -----------------------------------------
+  // Both modes share the same click-to-pick affordance (crosshair + hover
+  // outline); the active mode decides what a click does.
   var hovered = null;
   function onOver(e) {
-    if (!state.removeMode) return;
+    if (!state.removeMode && !state.identifyMode) return;
     if (panelContains(e.target)) return;
     if (hovered) hovered.classList.remove(NS + "-hi");
     hovered = e.target;
@@ -230,17 +249,102 @@
     hovered = null;
   }
   function onClick(e) {
-    if (!state.removeMode) return;
+    if (!state.removeMode && !state.identifyMode) return;
     if (panelContains(e.target)) return;
     e.preventDefault();
     e.stopPropagation();
     var t = e.target;
     t.classList.remove(NS + "-hi");
+    if (state.identifyMode) {
+      identifyBodyFrom(t);
+      setIdentifyMode(false);
+      return;
+    }
     // Record a durable selector alongside the node so the removal set can be
     // saved as a preset and replayed on a fresh load of a similar page, and
     // the node's prior inline display so Undo can restore it exactly.
     state.removed.push({ el: t, sel: cssPath(t), prev: hideNode(t) });
     updateCounts();
+  }
+
+  // ---- body-text identification --------------------------------------------
+  // The Format sliders (body size, line height) need to know which elements ARE
+  // body text. The generic selector guesses wrong on div-based layouts, so let
+  // the user point at a real paragraph. We first look for a SIMPLE descriptor —
+  // the element's tag plus any stable classes (or a semantic text tag on its
+  // own); if there isn't one (e.g. a bare <div> styled only by its style
+  // attribute), we fall back to treating that style attribute as a SIGNATURE
+  // and match every same-tag element carrying the identical style. Matches are
+  // marked with the NS-body class, which the sliders and the on-screen wash key
+  // off.
+  function simpleBodySelector(node) {
+    var tag = node.localName;
+    var cls = stableClasses(node); // letter-ish, non-namespaced classes
+    if (cls.length) return tag + "." + cls.join(".");
+    if (tag === "p" || tag === "li" || tag === "blockquote") return tag;
+    return null; // no clean descriptor — caller falls back to the signature
+  }
+  function clearBodyMarks() {
+    var marked = document.getElementsByClassName(NS + "-body");
+    // Live collection — iterate from the end while removing.
+    for (var i = marked.length - 1; i >= 0; i--) marked[i].classList.remove(NS + "-body");
+    state.bodyIdentified = false;
+  }
+  function identifyBodyFrom(target) {
+    if (!target || target.nodeType !== 1) return;
+    clearBodyMarks();
+    var matched = [];
+    var sel = simpleBodySelector(target);
+    if (sel) {
+      try {
+        matched = Array.prototype.slice.call(document.querySelectorAll(sel));
+      } catch (e) {
+        matched = [];
+      }
+    }
+    var how = "style";
+    if (matched.length) {
+      how = sel;
+    } else {
+      // Signature fallback: same tag + identical style attribute.
+      var sig = target.getAttribute("style") || "";
+      var tag = target.localName;
+      matched = Array.prototype.filter.call(
+        document.getElementsByTagName(tag),
+        function (n) {
+          return (n.getAttribute("style") || "") === sig;
+        }
+      );
+      how = tag + "[style]";
+    }
+    if (!matched.length) matched = [target];
+    matched.forEach(function (n) {
+      if (panelContains(n)) return;
+      n.classList.add(NS + "-body");
+    });
+    state.bodyIdentified = true;
+    render_style();
+    updateBodyBtn();
+    toast(
+      "Body text identified — " + matched.length + " block" +
+        (matched.length === 1 ? "" : "s") + " (matched by " + how + ")."
+    );
+  }
+  function setIdentifyMode(on) {
+    state.identifyMode = on;
+    if (on) setRemoveMode(false); // the two picking modes are exclusive
+    updateBodyBtn();
+    if (!on) onOut();
+  }
+  function updateBodyBtn() {
+    var btn = document.getElementById(NS + "-bodybtn");
+    if (!btn) return;
+    btn.setAttribute("aria-pressed", state.identifyMode);
+    btn.textContent = state.identifyMode
+      ? "● Click your body text"
+      : state.bodyIdentified
+      ? "Identify Body ✓"
+      : "Identify Body";
   }
   function panelContains(node) {
     var p = document.getElementById(NS + "-panel");
@@ -248,6 +352,11 @@
   }
   function setRemoveMode(on) {
     state.removeMode = on;
+    if (on && state.identifyMode) {
+      // The two picking modes are exclusive; drop identify without recursing.
+      state.identifyMode = false;
+      updateBodyBtn();
+    }
     // The button may not be in the document yet (initial showPane runs while
     // the panel is still being built); default text/aria already match `off`.
     var btn = document.getElementById(NS + "-removebtn");
@@ -1282,16 +1391,27 @@
       paneEdit.style.display = editing ? "" : "none";
       paneFormat.style.display = editing ? "none" : "";
       if (editing) setRemoveMode(false);
+      else setIdentifyMode(false);
       cEdit.style.cssText = "font-size:12px;text-decoration:none;cursor:pointer;" + (editing ? CRUMB_ON : CRUMB_OFF);
       cFormat.style.cssText = "font-size:12px;text-decoration:none;cursor:pointer;" + (editing ? CRUMB_OFF : CRUMB_ON);
       // The Format stage shows the real rendered PDF inline; Edit hides it so
       // the live page is interactive again for logging in / removing clutter.
       state.previewMode = !editing;
+      // Re-render so the body-text wash (Edit-only) turns off in Format and the
+      // rendered PDF never carries it.
+      render_style();
       if (editing) closePreview();
       else openPreview();
       panel.scrollTop = 0;
     }
 
+    var bodyBtn = el("button", {
+      id: NS + "-bodybtn",
+      style: STYLE_BTN,
+      "aria-pressed": "false",
+      title: "Click a paragraph so the Format sliders resize the right text",
+      onclick: function () { setIdentifyMode(!state.identifyMode); },
+    }, ["Identify Body"]);
     var nextBtn = el("button", {
       style: STYLE_PRIMARY, onclick: function () { showPane("format"); },
     }, ["Next: Format →"]);
@@ -1314,6 +1434,8 @@
     paneEdit.appendChild(sep());
     paneEdit.appendChild(presetsUI);
     paneEdit.appendChild(sep());
+    paneEdit.appendChild(bodyBtn);
+    paneEdit.appendChild(el("div", { style: "height:6px" }));
     paneEdit.appendChild(nextBtn);
 
     // Pane 2 (Format)

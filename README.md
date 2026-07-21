@@ -130,6 +130,17 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   `@page` counters, so they're stamped onto the finished PDF in Rust
   (`lopdf`) — drawn in the margin bands in 9pt Helvetica. Pure Rust, so the
   same code will serve iOS.
+- **Identify body text:** the Body / Line-height sliders resize a generic
+  selector (`body, p, li, …`) by default, which misfires on div-based layouts.
+  **Identify Body** (Edit pane) lets the user click a real paragraph; the
+  editor first looks for a SIMPLE descriptor — the element's tag plus stable
+  classes, or a semantic text tag on its own — and if there isn't one (a bare
+  `<div>` styled only by its `style` attribute) falls back to that style
+  attribute as a SIGNATURE, matching every same-tag element carrying it. Every
+  match gets the `NS-body` class, which the sliders then target instead of the
+  generic selector. Identified text gets a light-blue wash for confirmation,
+  shown only while editing (gated on `previewMode`, plus an `@media print`
+  reset) so it never reaches the rendered PDF.
 - **Page range:** a printer-style range from the Format pane (e.g. `1-3, 5`)
   rides the export sentinel and, after pagination, trims the PDF to just those
   pages before the header/footer stamp runs — so page numbers count the
