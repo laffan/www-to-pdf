@@ -59,6 +59,7 @@
       title: document.title || "",
       url: location.href,
       author: "",
+      publication: "",
       accessDate: new Date().toISOString().slice(0, 10),
       notes: "",
       show: false,
@@ -228,6 +229,7 @@
     var rows = [
       ["URL", m.url],
       ["Author", m.author],
+      ["Publication", m.publication],
       ["Accessed", m.accessDate],
       ["Notes", m.notes],
     ]
@@ -238,9 +240,22 @@
         return "<dt>" + esc(r[0]) + "</dt><dd>" + esc(r[1]) + "</dd>";
       })
       .join("");
+    // When "Extract identified content" is showing the article's own (styled)
+    // header, don't also print the plain title here — it would double up.
+    var hideTitle = extractionActive() && state.identify.sigs.header.length > 0;
     host.innerHTML =
-      (m.title ? "<h1>" + esc(m.title) + "</h1>" : "") + "<dl>" + rows + "</dl>";
+      (m.title && !hideTitle ? "<h1>" + esc(m.title) + "</h1>" : "") + "<dl>" + rows + "</dl>";
     render_style();
+  }
+  // Set a metadata field from code, syncing state, the panel input and the
+  // rendered header. Blank values are ignored (don't clobber a typed value).
+  function setMetaField(key, value) {
+    value = (value == null ? "" : String(value)).replace(/\s+/g, " ").trim();
+    if (!value) return;
+    state.meta[key] = value;
+    var input = document.getElementById(NS + "-metafield-" + key);
+    if (input) input.value = value;
+    renderMeta();
   }
 
   // ---- remove mode / identify-content pick modes ---------------------------
@@ -350,6 +365,11 @@
       sel ? { sel: sel } : { tag: node.localName, style: node.getAttribute("style") || "" },
     ];
     reapplyIdentified();
+    // Picking the author also fills the metadata Author field (strip a leading
+    // "By"). The user can still edit it afterwards.
+    if (cat === "author") {
+      setMetaField("author", (node.textContent || "").replace(/^\s*by[:\s]+/i, ""));
+    }
     toast(cat + " set.");
   }
   function isIdentified(el) {
@@ -455,33 +475,55 @@
       clone.classList.add(NS + "-body"); // sliders drive size + line-height
       if (cs) clone.style.setProperty("font-family", cs.fontFamily);
       clone.style.setProperty("margin", "0 0 1em");
+      clone.style.setProperty("text-align", "left");
     } else if (cs) {
+      // Masthead pieces (header/author/date) — preserve only their font; the
+      // masthead wrapper centres them.
       clone.style.setProperty("font-family", cs.fontFamily);
       clone.style.setProperty("font-size", cs.fontSize);
       clone.style.setProperty("font-weight", cs.fontWeight);
       clone.style.setProperty("font-style", cs.fontStyle);
       clone.style.setProperty("line-height", cs.lineHeight);
-      clone.style.setProperty("margin", cat === "header" ? "0 0 .15em" : "0 0 .1em");
+      clone.style.setProperty(
+        "margin",
+        cat === "header" ? "0 0 .25em" : "0 0 .1em"
+      );
     }
     return clone;
   }
   var _extracted = null; // { container, hidden:[{el,v,p}], body:{bg,color} }
+  function extractionActive() {
+    return !!_extracted;
+  }
   function applyExtract() {
     if (_extracted) return;
     var container = el("div", {
       id: NS + "-extracted",
       style:
         "color:#111!important;background:transparent!important;max-width:none!important;" +
-        "position:relative!important;z-index:1!important;font-family:inherit",
+        "position:relative!important;z-index:1!important;font-family:inherit;padding:0.5em 0 0",
     });
-    CATS.forEach(function (cat) {
+    // Title / author / date form a centred, padded masthead; body follows,
+    // left-aligned.
+    var masthead = el("div", {
+      style:
+        "text-align:center!important;margin:0 auto 1.6em!important;padding:0 0 1em!important",
+    });
+    ["header", "author", "date"].forEach(function (cat) {
       Array.prototype.slice
         .call(document.getElementsByClassName(NS + "-" + cat))
         .forEach(function (src) {
           if (panelContains(src)) return;
-          container.appendChild(cleanClone(src, cat));
+          masthead.appendChild(cleanClone(src, cat));
         });
     });
+    if (masthead.children.length) container.appendChild(masthead);
+    Array.prototype.slice
+      .call(document.getElementsByClassName(NS + "-body"))
+      .forEach(function (src) {
+        if (panelContains(src)) return;
+        container.appendChild(cleanClone(src, "body"));
+      });
     // Nothing identified — don't blank the page.
     if (!container.children.length) return;
     _extracted = { container: container, hidden: [], body: {} };
@@ -507,6 +549,7 @@
     document.body.style.setProperty("background-color", "#fff", "important");
     document.body.style.setProperty("color", "#111", "important");
     document.body.appendChild(container);
+    renderMeta(); // drop the duplicate plain title now the styled one shows
   }
   function restoreExtract() {
     if (!_extracted) return;
@@ -521,6 +564,7 @@
     if (b.color.v) document.body.style.setProperty("color", b.color.v, b.color.p);
     else document.body.style.removeProperty("color");
     _extracted = null;
+    renderMeta(); // bring the plain title back for the non-extract paths
   }
   // Toggle the identify-content effects on the live DOM (called by showPane as
   // the user moves between Edit and Format).
@@ -1098,6 +1142,7 @@
   // archive.is home page (survives the cross-origin navigation; the server
   // ignores it, the editor there reads it back).
   var ARCHIVE_FRAG = "wwwpdf=";
+  var ARCHIVE_ORIG_KEY = "wwwpdf:archiveOrig"; // stash the original URL across submit
   function onArchivePage() {
     try {
       return ARCHIVE_HOST_RE.test(location.hostname);
@@ -1107,15 +1152,24 @@
   }
   // Recover the original article URL from an archive.is location so metadata can
   // point at the source, not the snapshot. Snapshot URLs embed it after the id
-  // (archive.ph/<id>/https://…); the submit URL carries it in ?url=.
+  // (archive.ph/<id>/https://…, sometimes prefixed /o/ or a date); the submit
+  // URL carries it in ?url=. As a last resort use the URL stashed at submit
+  // time (same-origin snapshots).
   function originalFromArchive() {
     var h = location.href;
-    var m = h.match(/^https?:\/\/archive\.[a-z]+\/\w+\/(https?:\/\/.+)$/i);
-    if (m) return m[1];
+    // First embedded http(s):// after the archive host, whatever the id shape.
+    var m = h.match(/^https?:\/\/archive\.[a-z.]+\/.*?(https?:\/\/.+)$/i);
+    if (m) {
+      try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
+    }
     try {
       var p = new URL(h).searchParams.get("url");
-      if (p) return p.replace(/^https?:\/\/archive\.[a-z]+\//i, "");
-    } catch (e) {}
+      if (p) return p.replace(/^https?:\/\/archive\.[a-z.]+\//i, "");
+    } catch (e2) {}
+    try {
+      var saved = localStorage.getItem(ARCHIVE_ORIG_KEY);
+      if (saved) return saved;
+    } catch (e3) {}
     return null;
   }
   function loadInWebview(u) {
@@ -1151,7 +1205,7 @@
     var hashtags = document.getElementById("hashtags");
     if (hashtags) hashtags.remove();
     var orig = originalFromArchive();
-    if (orig) state.meta.url = orig;
+    if (orig) setMetaField("url", orig);
     if (!state.meta.title) state.meta.title = document.title || "";
     renderMeta();
     toast("Content extracted — remove anything extra, then continue to Format.");
@@ -1176,6 +1230,9 @@
       target = hash.slice(at + ARCHIVE_FRAG.length);
     }
     if (!/^https?:\/\//i.test(target)) return;
+    // Remember the original so metadata can cite it once we land on the snapshot
+    // (whose URL may not embed it). Same-origin only, but a useful fallback.
+    try { localStorage.setItem(ARCHIVE_ORIG_KEY, target); } catch (e0) {}
     var tries = 0;
     (function attempt() {
       if (_archiveSubmitted) return;
@@ -1448,6 +1505,7 @@
     });
     function field(label, key, type) {
       var input = el("input", {
+        id: NS + "-metafield-" + key, // so identify-content can populate it
         type: type || "text",
         value: state.meta[key] || "",
         style:
@@ -1465,6 +1523,7 @@
     metaFields.appendChild(field("Title", "title"));
     metaFields.appendChild(field("URL", "url"));
     metaFields.appendChild(field("Author", "author"));
+    metaFields.appendChild(field("Publication", "publication"));
     metaFields.appendChild(field("Access date", "accessDate", "date"));
     metaFields.appendChild(field("Notes", "notes"));
 
@@ -2216,6 +2275,12 @@
     // <title> is parsed — so the parse-time default is always "". Fill it in
     // now (mount runs at DOMContentLoaded, when the title exists).
     if (!state.meta.title) state.meta.title = document.title || "";
+    // On an archive.is snapshot the address bar is the archive URL; the metadata
+    // header should cite the ORIGINAL article, so recover it up front.
+    if (onArchivePage()) {
+      var oa = originalFromArchive();
+      if (oa) state.meta.url = oa;
+    }
     ensureStyle();
     ensureSafeAreaViewport();
     renderMeta();

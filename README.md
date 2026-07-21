@@ -21,7 +21,7 @@ lets you jump straight back to any of them:
    visits or on other sites with the same layout (e.g. any Substack).
 3. **Format** — "Next" flips the toolbar to formatting: body size, line height,
    heading scale, per-side margins (US Letter), a sans-serif metadata header
-   (title, URL, author, access date, notes), header/footer with optional
+   (title, URL, author, publication, access date, notes), header/footer with optional
    page numbers, and a printer-style **page range** ("1-3, 5") that trims the
    output to just those pages. Entering Format renders the **real PDF and shows
    it inline** (drawn by pdf.js on a gray backdrop) — the actual paginated
@@ -144,14 +144,20 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
     descendants** (nested spans were defeating the slider) so `NS-body`'s rule
     wins; and
   - if **Extract identified content** is on, the page's own markup is scrapped
-    and rebuilt as a clean structure of just the identified header → author →
-    date → body, in that order — each a cloned copy with all styling/classes
-    stripped and **only the computed font re-applied** (body clones keep
-    `NS-body` so the sliders drive them). The originals are hidden and the page
-    background/text colour neutralised so it reads on white paper.
+    and rebuilt as a clean structure of just the identified header / author /
+    date / body — each a cloned copy with all styling/classes stripped and
+    **only the computed font re-applied** (body clones keep `NS-body` so the
+    sliders drive them). Title/author/date form a centred, padded masthead; the
+    body follows left-aligned. Originals are hidden and the page
+    background/text colour neutralised so it reads on white paper. When this is
+    on, the metadata header drops its own plain title so it isn't doubled with
+    the styled one.
 
   Both effects apply to the live DOM the renderer captures and undo themselves
-  on the way back to Edit.
+  on the way back to Edit. Picking an **Author** also fills the metadata Author
+  field; on an archive.is snapshot the metadata URL is recovered as the original
+  article (parsed from the snapshot URL, or stashed at submit time), not the
+  archive address.
 - **Page range:** a printer-style range from the Format pane (e.g. `1-3, 5`)
   rides the export sentinel and, after pagination, trims the PDF to just those
   pages before the header/footer stamp runs — so page numbers count the
