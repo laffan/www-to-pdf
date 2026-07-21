@@ -851,6 +851,9 @@
     inner.forEach(function (node) {
       document.body.appendChild(node);
     });
+    // archive.is injects a #hashtags table inside the content; drop it too.
+    var hashtags = document.getElementById("hashtags");
+    if (hashtags) hashtags.remove();
     var orig = originalFromArchive();
     if (orig) state.meta.url = orig;
     if (!state.meta.title) state.meta.title = document.title || "";
