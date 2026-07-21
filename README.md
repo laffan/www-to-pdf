@@ -11,17 +11,22 @@ lets you jump straight back to any of them:
    title once loaded). The one webview then navigates to the site in place.
    Clicking **Link** in the breadcrumb returns here.
 2. **Edit** — log in if needed, then click elements to remove clutter (nav
-   bars, cookie banners, ads…). A built-in **ad blocker** (Bushido-style —
-   EasyList cosmetic filters via Brave's adblock engine) hides known ad
-   containers automatically; toggle it in the pane. Removal sets save as
-   **presets**, re-applied on later visits or on other sites with the same
-   layout (e.g. any Substack).
+   bars, cookie banners, ads…). An **archive.is mode** checkbox (above the ad
+   blocker) reroutes the current article through archive.is for a paywall-free
+   snapshot; after you clear its bot check, **Extract Content** lifts the
+   snapshot's `#CONTENT` out and drops archive.is's own chrome so it edits like
+   any other page. A built-in **ad blocker** (Bushido-style — EasyList cosmetic
+   filters via Brave's adblock engine) hides known ad containers automatically;
+   toggle it in the pane. Removal sets save as **presets**, re-applied on later
+   visits or on other sites with the same layout (e.g. any Substack).
 3. **Format** — "Next" flips the toolbar to formatting: body size, line height,
    heading scale, per-side margins (US Letter), a sans-serif metadata header
-   (title, URL, author, access date, notes), and header/footer with optional
-   page numbers. Entering Format renders the **real PDF and shows it inline**
-   (drawn by pdf.js on a gray backdrop) — the actual paginated output, not an
-   HTML approximation. "Refresh preview" re-renders after you adjust settings.
+   (title, URL, author, access date, notes), header/footer with optional
+   page numbers, and a printer-style **page range** ("1-3, 5") that trims the
+   output to just those pages. Entering Format renders the **real PDF and shows
+   it inline** (drawn by pdf.js on a gray backdrop) — the actual paginated
+   output, not an HTML approximation. "Refresh preview" re-renders after you
+   adjust settings.
 4. **Save** — writes the previewed PDF (save dialog on desktop, share sheet on
    iOS).
 
@@ -125,6 +130,20 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   `@page` counters, so they're stamped onto the finished PDF in Rust
   (`lopdf`) — drawn in the margin bands in 9pt Helvetica. Pure Rust, so the
   same code will serve iOS.
+- **Page range:** a printer-style range from the Format pane (e.g. `1-3, 5`)
+  rides the export sentinel and, after pagination, trims the PDF to just those
+  pages before the header/footer stamp runs — so page numbers count the
+  survivors. Pure Rust in `paginate.rs` (`parse_page_ranges` + `trim_to_range`,
+  unit-tested): the paginated document is a single flat page tree, so trimming
+  is a rebuild of its `Kids`. A blank or all-covering range is a no-op.
+- **archive.is mode:** paywalled or framing-blocked articles can be routed
+  through archive.is from the Edit pane. Checking the box navigates the webview
+  (via the same `wwwtopdf.load` native-load sentinel the URL entry uses) to
+  `archive.is/submit/?url=…` for the current page; the user clears archive.is's
+  bot check, then **Extract Content** promotes the snapshot's `#CONTENT`
+  element to the top of the body and removes every other node except the tool's
+  own chrome, recovering the original URL for the metadata header. From there
+  it's a normal edit → format → save.
 - **Removal presets:** each clicked removal records a durable CSS selector
   (nearest sane id, else `tag.stable-classes` path; build-hashed class names
   are skipped). The toolbar shows a dropdown (a preset auto-applies on

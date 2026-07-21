@@ -586,6 +586,7 @@ async fn do_export(app: tauri::AppHandle, url: Url) {
     let header = non_empty(get("header"));
     let footer = non_empty(get("footer"));
     let page_numbers = get("pagenum") == "1";
+    let range = get("range");
     let action = get("action");
     let title = get("title");
 
@@ -597,6 +598,9 @@ async fn do_export(app: tauri::AppHandle, url: Url) {
             .get_webview_window("main")
             .ok_or_else(|| "main window missing".to_string())?;
         render_pdf(&webview, &m, &out_str).await?;
+        // Trim to the requested page range BEFORE stamping so page numbers
+        // count the pages that actually survive into the output.
+        paginate::trim_to_range(&out_str, &range)?;
         stamp_header_footer(&out_str, &m, header.as_deref(), footer.as_deref(), page_numbers)?;
         Ok::<(), String>(())
     }

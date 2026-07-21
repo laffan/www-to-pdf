@@ -292,6 +292,89 @@ pub fn paginate_segments(
     Ok(())
 }
 
+/// Parse a printer-style page range spec ("1-3, 5, 8-10") into a sorted, deduped
+/// list of 1-based page numbers within `[1, total]`. Returns `None` when the
+/// spec is blank or resolves to nothing valid — the caller reads that as "keep
+/// every page". Open-ended ranges are allowed: "3-" runs to the end, "-3" from
+/// the start; a reversed range ("5-2") is treated as "2-5".
+pub fn parse_page_ranges(spec: &str, total: usize) -> Option<Vec<usize>> {
+    let spec = spec.trim();
+    if spec.is_empty() || total == 0 {
+        return None;
+    }
+    let mut keep: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(dash) = part.find('-') {
+            let lo = part[..dash].trim().parse::<usize>().ok();
+            let hi = part[dash + 1..].trim().parse::<usize>().ok();
+            let (lo, hi) = match (lo, hi) {
+                (Some(a), Some(b)) => (a.min(b), a.max(b)),
+                (Some(a), None) => (a, total), // "3-" -> to the end
+                (None, Some(b)) => (1, b),     // "-3" -> from the start
+                (None, None) => continue,
+            };
+            for p in lo.max(1)..=hi.min(total) {
+                keep.insert(p);
+            }
+        } else if let Ok(p) = part.parse::<usize>() {
+            if (1..=total).contains(&p) {
+                keep.insert(p);
+            }
+        }
+    }
+    if keep.is_empty() {
+        None
+    } else {
+        Some(keep.into_iter().collect())
+    }
+}
+
+/// Keep only the pages named by `spec` (printer-style range) in the PDF at
+/// `path`, rewriting it in place and renumbering the survivors 1..N. A blank
+/// spec, or one that keeps every page, is a no-op. The paginated document has a
+/// single flat Pages node (see `paginate_segments`), so trimming is just a
+/// rebuild of that node's `Kids`; the dropped page objects become unreferenced
+/// (harmless in the output).
+pub fn trim_to_range(path: &str, spec: &str) -> Result<(), String> {
+    if spec.trim().is_empty() {
+        return Ok(());
+    }
+    let mut doc = Document::load(path).map_err(|e| format!("trim: load: {e}"))?;
+    let ordered: Vec<lopdf::ObjectId> = doc.get_pages().into_values().collect();
+    let total = ordered.len();
+    let Some(keep) = parse_page_ranges(spec, total) else {
+        return Ok(()); // nothing valid to trim to -> keep all
+    };
+    if keep.len() >= total {
+        return Ok(()); // range covers the whole document
+    }
+    let kept: Vec<Object> = keep
+        .iter()
+        .filter_map(|&p| ordered.get(p - 1).copied())
+        .map(Object::Reference)
+        .collect();
+    if kept.is_empty() {
+        return Ok(()); // never emit a zero-page PDF
+    }
+    // All paginated pages share one Parent; read it off the first survivor.
+    let parent_id = doc
+        .get_dictionary(ordered[keep[0] - 1])
+        .map_err(|e| e.to_string())?
+        .get(b"Parent")
+        .and_then(|o| o.as_reference())
+        .map_err(|_| "trim: page has no Parent".to_string())?;
+    let n = kept.len();
+    let pages_dict = doc.get_dictionary_mut(parent_id).map_err(|e| e.to_string())?;
+    pages_dict.set("Kids", Object::Array(kept));
+    pages_dict.set("Count", Object::Integer(n as i64));
+    doc.save(path).map_err(|e| format!("trim: save: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +547,56 @@ mod tests {
         // exist (Document::load + get_page_content already prove decoding).
         let ops4 = String::from_utf8(doc.get_page_content(ids[3]).unwrap()).unwrap();
         assert!(ops4.contains("/Fm0 Do"));
+    }
+
+    #[test]
+    fn parse_ranges_covers_the_common_cases() {
+        assert_eq!(parse_page_ranges("1-3,5", 10), Some(vec![1, 2, 3, 5]));
+        assert_eq!(parse_page_ranges("3", 10), Some(vec![3]));
+        // Whitespace, duplicates and out-of-order parts all normalize.
+        assert_eq!(parse_page_ranges(" 2 - 4 , 4 , 1 ", 10), Some(vec![1, 2, 3, 4]));
+        assert_eq!(parse_page_ranges("5-2", 10), Some(vec![2, 3, 4, 5])); // reversed
+        assert_eq!(parse_page_ranges("8-20", 10), Some(vec![8, 9, 10])); // clamp high
+        assert_eq!(parse_page_ranges("3-", 5), Some(vec![3, 4, 5])); // open end
+        assert_eq!(parse_page_ranges("-3", 5), Some(vec![1, 2, 3])); // open start
+        // Blank or all-invalid input means "keep everything".
+        assert_eq!(parse_page_ranges("", 5), None);
+        assert_eq!(parse_page_ranges("   ", 5), None);
+        assert_eq!(parse_page_ranges("99", 5), None);
+        assert_eq!(parse_page_ranges("0", 5), None);
+        assert_eq!(parse_page_ranges("1-3", 0), None); // no pages to keep
+    }
+
+    #[test]
+    fn trim_keeps_only_selected_pages() {
+        let dir = std::env::temp_dir().join("wwwtopdf-trim-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let seg = dir.join("seg0.pdf");
+        // 3000px at 0.75 pt/px -> 468 x 2250 pt, which paginates to 4 pages.
+        make_segment_pdf(&seg, 468.0, 2250.0, "trim");
+        let meas = Meas { h: 3000.0, w: 624.0, b: vec![] };
+        let m = margins_1in();
+        let tops = compute_page_tops_px(&meas, &m);
+        let out = dir.join("out.pdf");
+        let out_str = out.to_string_lossy().into_owned();
+        paginate_segments(
+            &[Segment { path: seg.to_string_lossy().into_owned(), top: 0.0 }],
+            &out_str,
+            &m,
+            &meas,
+            &tops,
+        )
+        .unwrap();
+        assert_eq!(Document::load(&out).unwrap().get_pages().len(), 4);
+
+        // Keep 1, 2 and 4 -> a 3-page document.
+        trim_to_range(&out_str, "1-2, 4").unwrap();
+        assert_eq!(Document::load(&out).unwrap().get_pages().len(), 3);
+
+        // A blank spec or a full-cover range leaves the (now 3-page) doc alone.
+        trim_to_range(&out_str, "").unwrap();
+        assert_eq!(Document::load(&out).unwrap().get_pages().len(), 3);
+        trim_to_range(&out_str, "1-3").unwrap();
+        assert_eq!(Document::load(&out).unwrap().get_pages().len(), 3);
     }
 }

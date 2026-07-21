@@ -41,6 +41,9 @@
     header: "",
     footer: "",
     pageNumbers: false,
+    // Printer-style page range ("1-3, 5") that trims the exported PDF to just
+    // those pages; blank = every page. Applied in Rust after pagination.
+    pageRange: "",
     meta: {
       title: document.title || "",
       url: location.href,
@@ -767,6 +770,117 @@
     return el("div", {}, [label, row]);
   }
 
+  // ---- archive.is mode (native) ---------------------------------------------
+  // Route the current article through archive.is, which renders a static,
+  // paywall-free snapshot of pages that otherwise block framing / need a login.
+  // Checking the box navigates this webview (via the same native-load sentinel
+  // as the URL-entry page) to archive.is's submit endpoint for the current URL.
+  // archive.is answers with a bot check; once the user clears it the snapshot
+  // loads with its article inside a #CONTENT div. "Extract Content" lifts that
+  // div to the top of the page and drops archive.is's own chrome, so the result
+  // edits and exports exactly like any other page.
+  var ARCHIVE_HOST_RE = /(^|\.)archive\.(is|today|ph|li|md|vn|fo|ec)$/i;
+  function onArchivePage() {
+    try {
+      return ARCHIVE_HOST_RE.test(location.hostname);
+    } catch (e) {
+      return false;
+    }
+  }
+  // https://example.com/x  ->
+  // https://archive.is/submit/?url=https%3A%2F%2Farchive.is%2Fhttps%3A%2F%2Fexample.com%2Fx
+  function archiveSubmitUrl(u) {
+    return "https://archive.is/submit/?url=" + encodeURIComponent("https://archive.is/" + u);
+  }
+  // Recover the original article URL from an archive.is location so metadata can
+  // point at the source, not the snapshot. Snapshot URLs embed it after the id
+  // (archive.ph/<id>/https://…); the submit URL carries it in ?url=.
+  function originalFromArchive() {
+    var h = location.href;
+    var m = h.match(/^https?:\/\/archive\.[a-z]+\/\w+\/(https?:\/\/.+)$/i);
+    if (m) return m[1];
+    try {
+      var p = new URL(h).searchParams.get("url");
+      if (p) return p.replace(/^https?:\/\/archive\.[a-z]+\//i, "");
+    } catch (e) {}
+    return null;
+  }
+  function loadInWebview(u) {
+    // Same native-load sentinel main.js uses: a JS location change on iOS can be
+    // hijacked by an installed app's Universal Link, so Rust does the load.
+    window.location.href = "https://" + LOAD_HOST + "/?url=" + encodeURIComponent(u);
+  }
+  function extractArchiveContent() {
+    var content = document.getElementById("CONTENT");
+    if (!content) {
+      toast("No archived content yet — clear the bot check and let the snapshot load, then try again.");
+      return;
+    }
+    // Promote #CONTENT and drop every other top-level node, keeping only our own
+    // toolbar / preview / metadata / style (ids prefixed with the namespace).
+    document.body.insertBefore(content, document.body.firstChild);
+    Array.prototype.slice.call(document.body.children).forEach(function (child) {
+      if (child === content) return;
+      if (child.id && child.id.indexOf(NS) === 0) return;
+      child.remove();
+    });
+    // archive.is positions its content wrapper; neutralize that so it flows
+    // normally down the printable column.
+    try {
+      content.style.setProperty("position", "static", "important");
+      content.style.setProperty("float", "none", "important");
+      content.style.setProperty("margin", "0 auto", "important");
+      content.style.setProperty("max-width", "none", "important");
+    } catch (e) {}
+    var orig = originalFromArchive();
+    if (orig) state.meta.url = orig;
+    if (!state.meta.title) state.meta.title = document.title || "";
+    renderMeta();
+    toast("Content extracted — remove anything extra, then continue to Format.");
+    refreshArchiveUI();
+  }
+  // Rebound to the real updater when the panel is built.
+  var refreshArchiveUI = function () {};
+  function buildArchive() {
+    var cb = el("input", {
+      type: "checkbox",
+      onchange: function (e) {
+        if (e.target.checked) {
+          if (onArchivePage()) return; // already on a snapshot
+          toast("Opening archive.is…");
+          loadInWebview(archiveSubmitUrl(location.href));
+        } else if (onArchivePage()) {
+          // Un-checking on a snapshot returns to the original article.
+          var orig = originalFromArchive();
+          if (orig) loadInWebview(orig);
+        }
+      },
+    });
+    var label = el(
+      "label",
+      { style: "display:flex;align-items:center;gap:8px;cursor:pointer;padding:2px 0" },
+      [cb, el("span", { style: "font-weight:600" }, ["archive.is mode"])]
+    );
+    var extractBtn = el(
+      "button",
+      { style: STYLE_BTN + ";text-align:center;margin-top:6px", onclick: extractArchiveContent },
+      ["Extract Content"]
+    );
+    var hint = el(
+      "div",
+      { style: "font-size:11px;color:#71717a;margin-top:4px" },
+      ["Loads a paywall-free snapshot. Clear the bot check, then Extract Content."]
+    );
+    refreshArchiveUI = function () {
+      var on = onArchivePage();
+      cb.checked = on;
+      extractBtn.style.display = on ? "block" : "none";
+      hint.style.display = on ? "none" : "block";
+    };
+    refreshArchiveUI();
+    return el("div", {}, [label, extractBtn, hint]);
+  }
+
   // ---- panel UI ------------------------------------------------------------
   var STYLE_BTN =
     "appearance:none;border:1px solid #d4d4d8;background:#fff;color:#18181b;" +
@@ -883,6 +997,7 @@
       style: "font-size:11px;color:#71717a;text-align:right",
     });
     count.textContent = state.removed.length + " removed";
+    var archiveUI = buildArchive();
     var adblockUI = buildAdblock(isNative);
 
     // ---- font controls ----
@@ -1007,6 +1122,11 @@
       ]
     );
 
+    // ---- page range (trim the output to specific pages) ----
+    // A printer-style range applied to the paginated PDF: "1-3, 5" keeps those
+    // pages, blank keeps all. Refresh the preview (or Save) to see it applied.
+    var rangeField = textField("Pages (e.g. 1-3, 5)", "pageRange", "blank = all pages");
+
     // ============================ WEB (flat, print) ============================
     if (!isNative) {
       titleSlot.appendChild(el("strong", { style: "font-size:13px" }, ["Prepare source"]));
@@ -1105,6 +1225,8 @@
     paneEdit.appendChild(removeRow);
     paneEdit.appendChild(count);
     paneEdit.appendChild(sep());
+    paneEdit.appendChild(archiveUI);
+    paneEdit.appendChild(sep());
     paneEdit.appendChild(adblockUI);
     paneEdit.appendChild(sep());
     paneEdit.appendChild(presetsUI);
@@ -1129,6 +1251,7 @@
     paneFormat.appendChild(headerField);
     paneFormat.appendChild(footerField);
     paneFormat.appendChild(pageNumToggle);
+    paneFormat.appendChild(rangeField);
     paneFormat.appendChild(sep());
     paneFormat.appendChild(previewBtn);
     paneFormat.appendChild(el("div", { style: "height:6px" }));
@@ -1319,6 +1442,8 @@
   var HOME_HOST = "wwwtopdf.home";
   var PRESET_HOST = "wwwtopdf.preset";
   var ADBLOCK_HOST = "wwwtopdf.adblock";
+  //   wwwtopdf.load?url=…                    -> native WKWebView load of a URL
+  var LOAD_HOST = "wwwtopdf.load";
 
   // Fonts/metadata already live in the page DOM (createPDF captures them);
   // only margins + header/footer/page-numbers + filename need to reach Rust.
@@ -1330,7 +1455,8 @@
       "&mt=" + m.top + "&mr=" + m.right + "&mb=" + m.bottom + "&ml=" + m.left +
       "&header=" + encodeURIComponent(state.header || "") +
       "&footer=" + encodeURIComponent(state.footer || "") +
-      "&pagenum=" + (state.pageNumbers ? "1" : "0");
+      "&pagenum=" + (state.pageNumbers ? "1" : "0") +
+      "&range=" + encodeURIComponent(state.pageRange || "");
     // Preview shows its status in the overlay; only save needs a toast.
     if (action !== "preview") toast("Rendering PDF…");
     setTimeout(function () {
