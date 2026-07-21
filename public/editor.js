@@ -130,6 +130,20 @@
       "." + NS + "-removed{display:none!important}",
       state.adblock.enabled ? state.adblock.cssText : "",
       "." + NS + "-hi{outline:2px solid #e11d48!important;outline-offset:-2px!important;cursor:crosshair!important;background:rgba(225,29,72,.08)!important}",
+      // Custom-drawn panel checkboxes. A native checkbox is invisible when
+      // unchecked in WKWebView (no border rendered) and can be shrunk to nothing
+      // inside a flex row, so we render our own: appearance:none + an explicit
+      // bordered box that shows a white tick when checked. Everything !important
+      // so the host page's input styling can't touch it.
+      "input." + NS + "-check{-webkit-appearance:none!important;appearance:none!important;box-sizing:border-box!important;" +
+        "width:16px!important;height:16px!important;min-width:16px!important;flex:0 0 auto!important;" +
+        "margin:0!important;padding:0!important;border:1.5px solid #9ca3af!important;border-radius:4px!important;" +
+        "background:#fff!important;display:inline-block!important;position:relative!important;cursor:pointer!important;" +
+        "vertical-align:middle!important;opacity:1!important;visibility:visible!important;box-shadow:none!important}",
+      "input." + NS + "-check:checked{background:#111!important;border-color:#111!important}",
+      "input." + NS + "-check:checked::after{content:''!important;display:block!important;position:absolute!important;" +
+        "left:5px!important;top:2px!important;width:3px!important;height:7px!important;box-sizing:content-box!important;" +
+        "border:solid #fff!important;border-width:0 2px 2px 0!important;transform:rotate(45deg)!important;background:none!important}",
       bodyRule,
       hs !== 1 ? headRule : "",
       guideRule,
@@ -708,7 +722,7 @@
   function buildAdblock(isNative) {
     var cb = el("input", {
       type: "checkbox",
-      style: STYLE_CHECK,
+      class: CLS_CHECK,
       onchange: function (e) {
         state.adblock.userChoice = e.target.checked;
         state.adblock.enabled = e.target.checked && state.adblock.selectors.length > 0;
@@ -845,14 +859,19 @@
   function buildArchive() {
     var cb = el("input", {
       type: "checkbox",
-      style: STYLE_CHECK,
+      class: CLS_CHECK,
       onchange: function (e) {
         if (e.target.checked) {
           if (onArchivePage()) return; // already on a snapshot
           toast("Opening archive.is…");
-          loadInWebview(archiveSubmitUrl(location.href));
+          // Navigate straight to archive.is — it has no companion app to hijack
+          // the link, and a direct navigation hands over the submit URL byte for
+          // byte, without the wwwtopdf.load sentinel's extra encode/decode hop.
+          window.location.href = archiveSubmitUrl(location.href);
         } else if (onArchivePage()) {
-          // Un-checking on a snapshot returns to the original article.
+          // Un-checking on a snapshot returns to the original article. That page
+          // may have an installed app, so route it through the native-load
+          // sentinel (which defeats iOS Universal-Link hijacking).
           var orig = originalFromArchive();
           if (orig) loadInWebview(orig);
         }
@@ -891,11 +910,10 @@
   var STYLE_PRIMARY =
     "appearance:none;border:0;background:#111;color:#fff;border-radius:8px;" +
     "padding:11px 12px;font:600 14px system-ui,sans-serif;cursor:pointer;width:100%";
-  // Checkboxes live inside display:flex labels. WebKit (WKWebView) will shrink a
-  // replaced flex item with no explicit size down toward zero width — the box
-  // then reads as "no checkbox at all." Pin the size and forbid shrinking so the
-  // control renders identically on every engine.
-  var STYLE_CHECK = "width:16px;height:16px;flex:none;margin:0;accent-color:#111;cursor:pointer";
+  // All panel checkboxes carry this class; the injected stylesheet draws them as
+  // a custom bordered box (see render_style) so they're always visible and can't
+  // be shrunk or hidden by the host page or the webview's native rendering.
+  var CLS_CHECK = NS + "-check";
 
   function buildPanel() {
     var isNative = !!window.__TAURI_INTERNALS__;
@@ -975,7 +993,7 @@
       [
         el("input", {
           type: "checkbox",
-          style: STYLE_CHECK,
+          class: CLS_CHECK,
           onchange: function (e) {
             state.meta.show = e.target.checked;
             metaFields.style.display = e.target.checked ? "grid" : "none";
@@ -1088,7 +1106,7 @@
       [
         el("input", {
           type: "checkbox",
-          style: STYLE_CHECK,
+          class: CLS_CHECK,
           onchange: function (e) {
             state.marginGuide = e.target.checked;
             render_style();
@@ -1125,7 +1143,7 @@
       [
         el("input", {
           type: "checkbox",
-          style: STYLE_CHECK,
+          class: CLS_CHECK,
           onchange: function (e) { state.pageNumbers = e.target.checked; },
         }),
         el("span", {}, ["Page numbers"]),
