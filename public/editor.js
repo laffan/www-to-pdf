@@ -2046,7 +2046,7 @@
       "&pagenum=" + (state.pageNumbers ? "1" : "0") +
       "&range=" + encodeURIComponent(state.pageRange || "");
     // Preview shows its status in the overlay; only save needs a toast.
-    if (action !== "preview") toast("Rendering PDF…");
+    if (action !== "preview") toast("Building the PDF…");
     setTimeout(function () {
       window.location.href = "https://" + EXPORT_HOST + "/?" + q;
     }, 30);
@@ -2061,6 +2061,7 @@
     var wasPreview = _pvPending;
     _pvPending = false;
     if (!ok && wasPreview && previewOverlay()) {
+      _pvState = "error";
       previewStatus("Preview failed: " + message);
       return;
     }
@@ -2074,6 +2075,14 @@
   // pdf.min.js + pdf.worker.min.js before the first chunk arrives.
   var _pvBuf = "";
   var _pvPending = false;
+  // Where the inline preview stands, polled by the native side (__pvState) so
+  // the render cover only lifts once real pages are on screen instead of on
+  // this overlay's own placeholder:
+  //   "none"    no preview open — nothing to wait for
+  //   "pending" rendering natively, or bytes arrived and pdf.js is drawing
+  //   "drawn"   the first page is painted
+  //   "error"   the render or the draw failed (the overlay says so)
+  var _pvState = "none";
 
   function previewOverlay() {
     return document.getElementById(NS + "-preview");
@@ -2123,12 +2132,14 @@
     if (ov) ov.remove();
     _pvBuf = "";
     _pvPending = false;
+    _pvState = "none";
   }
   // Re-render the current settings into the (already open) overlay.
   function requestPreview() {
     if (!previewOverlay()) return;
-    previewStatus("Rendering PDF…");
+    previewStatus("Building the PDF…");
     _pvPending = true;
+    _pvState = "pending";
     nativeExport("preview");
   }
 
@@ -2136,7 +2147,8 @@
   function pvBegin() {
     _pvBuf = "";
     _pvPending = false; // bytes are on the way — the render itself succeeded
-    previewStatus("Rendering PDF…");
+    _pvState = "pending";
+    previewStatus("Building the PDF…");
   }
   function pvChunk(s) {
     _pvBuf += s;
@@ -2150,6 +2162,7 @@
       bytes = new Uint8Array(bin.length);
       for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     } catch (e) {
+      _pvState = "error";
       previewStatus("Could not decode the preview.");
       return;
     }
@@ -2157,9 +2170,13 @@
   }
   function renderPreviewDoc(bytes) {
     var ov = previewOverlay();
-    if (!ov) return; // the user left the Format stage before bytes arrived
+    if (!ov) {
+      _pvState = "none"; // the user left the Format stage before bytes arrived
+      return;
+    }
     var lib = window.pdfjsLib;
     if (!lib || !lib.getDocument) {
+      _pvState = "error";
       previewStatus("Preview engine unavailable.");
       return;
     }
@@ -2191,10 +2208,17 @@
               canvas.width = Math.round(vp.width);
               canvas.height = Math.round(vp.height);
               pages.appendChild(canvas);
-              return page.render({
-                canvasContext: canvas.getContext("2d"),
-                viewport: vp,
-              }).promise;
+              return page
+                .render({
+                  canvasContext: canvas.getContext("2d"),
+                  viewport: vp,
+                })
+                .promise.then(function () {
+                  // First page painted: the preview is presentable, so the
+                  // native render cover can come down (the rest fill in
+                  // behind it).
+                  if (num === 1) _pvState = "drawn";
+                });
             });
           });
         };
@@ -2202,6 +2226,7 @@
         return chain;
       })
       .catch(function (e) {
+        _pvState = "error";
         previewStatus("Preview failed: " + (e && e.message ? e.message : e));
       });
   }
@@ -2337,6 +2362,11 @@
   window.wwwToPdf.__pvBegin = pvBegin;
   window.wwwToPdf.__pvChunk = pvChunk;
   window.wwwToPdf.__pvEnd = pvEnd;
+  // Polled by Rust while the render cover is up; always a string, since the
+  // native evaluateJavaScript bridge reads the result as one.
+  window.wwwToPdf.__pvState = function () {
+    return _pvState;
+  };
   // Ad blocking: Rust pushes the engine-computed selector set for this URL.
   window.wwwToPdf.setAdblockSelectors = function (list) {
     setAdblockSelectors(list, "engine");

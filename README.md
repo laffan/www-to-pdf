@@ -26,7 +26,9 @@ lets you jump straight back to any of them:
    output to just those pages. Entering Format renders the **real PDF and shows
    it inline** (drawn by pdf.js on a gray backdrop) — the actual paginated
    output, not an HTML approximation. "Refresh preview" re-renders after you
-   adjust settings.
+   adjust settings. The render itself happens **behind a cover** — the app
+   shows a spinner and a progress line, never the webview reshaping itself —
+   and the finished pages are what appears.
 4. **Save** — writes the previewed PDF (save dialog on desktop, share sheet on
    iOS).
 
@@ -115,6 +117,20 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   paragraphs taller than a page; segment cuts land exactly on page
   boundaries, so a segment edge can never split a line either). The webview
   frame and toolbar are restored after capture.
+- **The render is never on show.** Reshaping the live webview is what makes a
+  faithful capture possible, but watching it happen looks like the app
+  half-crashing: the page squeezes into a narrow column, the toolbar rides
+  along with it, and the rest of the window is bare chrome. So an opaque
+  **native cover** (an `NSView`/`UIView` with a system spinner and a status
+  line, in the same gray as the preview backdrop) is laid over the webview's
+  container for the whole export and lifted only when there's something
+  finished to show. Its status line follows the phases — *Preparing the page →
+  Capturing the page → Building the PDF* — and because it's a real view it also
+  swallows clicks, so the frozen page can't be edited mid-capture. On a preview
+  the cover is held past the render: Rust polls the editor's `__pvState` until
+  pdf.js has actually painted the first page (bounded to ~5s), so the preview
+  arrives complete rather than assembling itself on screen. Saving lifts it
+  before the save dialog / share sheet, so the app looks normal behind them.
 - **Settle (no truncation):** long articles render below the fold lazily
   (infinite scroll, `IntersectionObserver`-driven hydration, lazy images), so
   a height measured too early would capture a truncated PDF — the page looks

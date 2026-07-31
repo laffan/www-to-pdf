@@ -704,11 +704,19 @@ async fn do_export(app: tauri::AppHandle, url: Url) {
     let out = preview_path();
     let out_str = out.to_string_lossy().into_owned();
 
+    let Some(webview) = app.get_webview_window("main") else {
+        report(&app, false, "main window missing");
+        return;
+    };
+
+    // Everything below reshapes the live webview. Cover it first so the render
+    // happens out of sight, and don't lift the cover until there is something
+    // finished to show.
+    show_render_cover(&webview, "Preparing the page…");
+
     let render = async {
-        let webview = app
-            .get_webview_window("main")
-            .ok_or_else(|| "main window missing".to_string())?;
         render_pdf(&webview, &m, &out_str).await?;
+        set_render_cover_message(&webview, "Building the PDF…");
         // Trim to the requested page range BEFORE stamping so page numbers
         // count the pages that actually survive into the output.
         paginate::trim_to_range(&out_str, &range)?;
@@ -718,6 +726,7 @@ async fn do_export(app: tauri::AppHandle, url: Url) {
     .await;
 
     if let Err(e) = render {
+        hide_render_cover(&webview);
         report(&app, false, &e);
         return;
     }
@@ -725,12 +734,25 @@ async fn do_export(app: tauri::AppHandle, url: Url) {
     if action == "preview" {
         // Stream the rendered PDF into the in-page pdf.js overlay. On success
         // the overlay is the feedback, so there's no toast; only errors report.
-        if let Err(e) = present_inline_preview(&app, &out_str).await {
-            report(&app, false, &e);
+        match present_inline_preview(&app, &out_str).await {
+            Ok(()) => {
+                // Hold the cover until those pages are actually on screen, so
+                // the preview appears finished rather than assembling itself.
+                await_preview_paint(&webview).await;
+                hide_render_cover(&webview);
+            }
+            Err(e) => {
+                // Nothing is coming: uncover now so the message is visible.
+                hide_render_cover(&webview);
+                report(&app, false, &e);
+            }
         }
         return;
     }
 
+    // Save: the file dialog / share sheet is the next thing the user sees, so
+    // the app should look normal behind it.
+    hide_render_cover(&webview);
     match present_save(&app, &out_str, &title).await {
         Ok(Some(path)) => report(&app, true, &format!("Saved → {path}")),
         Ok(None) => report(&app, true, "Done"),
@@ -1125,6 +1147,10 @@ fn sanitize(s: &str) -> String {
 //   6. the webview frame and chrome are restored (and the page thawed).
 // The same createPDF/evaluateJavaScript calls exist on iOS, so this path is
 // mobile-ready.
+//
+// None of the reshaping above is ever seen: do_export lays an opaque native
+// cover over the webview for the whole export (see "render cover" below), so
+// the app shows a calm progress screen and then the finished PDF.
 
 // Core Graphics geometry, hand-encoded to avoid the objc2-foundation
 // feature-flag chain.
@@ -1302,6 +1328,366 @@ async fn set_webview_frame(
         .map_err(|_| "frame update timed out".to_string())?
         .map_err(|_| "frame update dropped".to_string())?
 }
+
+// ---- render cover: keep the render out of sight ----------------------------
+//
+// Rendering resizes the live WKWebView — narrow (the printable width) and then
+// very tall (the whole document) — because that is the only way to make the
+// real DOM reflow and lay itself out for createPDF. On screen that reads as
+// the app half-crashing: the page squeezes into a column, the in-page toolbar
+// rides along with it, and the rest of the window is bare chrome. Nothing is
+// actually wrong, so the fix is to stop showing it. An opaque native view is
+// laid over the webview for the length of an export and lifted only once the
+// finished PDF is on screen, so the work happens in the background and the
+// result is what gets presented. The cover matches the in-page preview
+// backdrop, so the hand-off to the pdf.js overlay is seamless, and being a
+// real view it also swallows clicks — the frozen page can't be edited
+// mid-capture.
+//
+// Held with a depth count: overlapping exports each take a reference, and the
+// cover lifts when the last one is done.
+
+/// Cover backdrop / text, matching the pdf.js preview overlay (#3f3f46 on
+/// #e4e4e7) so the two surfaces read as one.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const COVER_BG: (f64, f64, f64) = (0.247, 0.247, 0.275);
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const COVER_FG: (f64, f64, f64) = (0.894, 0.894, 0.906);
+
+// The live cover view and its label, as raw pointers. Only ever read or
+// written inside a `with_webview` closure — i.e. on the main thread — so the
+// UI queue serialises every access; nothing else may touch them.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static COVER_VIEW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static COVER_LABEL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static COVER_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// An autoreleased NSString for `s` (empty if `s` contains a NUL).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe fn ns_string(s: &str) -> *mut objc2::runtime::AnyObject {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    let c = std::ffi::CString::new(s).unwrap_or_default();
+    let ns: *mut AnyObject = msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()];
+    ns
+}
+
+/// Build the cover (an opaque view with a spinner and a status line) sized to
+/// `bounds`. Returns (cover, label); both are owned by the cover, which the
+/// caller owns. Every subview autoresizes so a window resize mid-render keeps
+/// the backdrop full-bleed and its contents centred.
+#[cfg(target_os = "macos")]
+unsafe fn build_cover(
+    bounds: geom::CGRect,
+    msg: &str,
+) -> (*mut objc2::runtime::AnyObject, *mut objc2::runtime::AnyObject) {
+    use crate::geom::{CGPoint, CGRect, CGSize};
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2::{class, msg_send};
+
+    let nil: *mut AnyObject = std::ptr::null_mut();
+    let cover: *mut AnyObject = msg_send![class!(NSView), new];
+    if cover.is_null() {
+        return (nil, nil);
+    }
+    let _: () = msg_send![cover, setFrame: bounds];
+    // Flexible width | height (NSView and UIView share these mask values).
+    let _: () = msg_send![cover, setAutoresizingMask: 18usize];
+    // Dark appearance so the system-drawn spinner reads on the dark backdrop.
+    let dark: *mut AnyObject =
+        msg_send![class!(NSAppearance), appearanceNamed: ns_string("NSAppearanceNameDarkAqua")];
+    if !dark.is_null() {
+        let _: () = msg_send![cover, setAppearance: dark];
+    }
+    let _: () = msg_send![cover, setWantsLayer: Bool::YES];
+    let layer: *mut AnyObject = msg_send![cover, layer];
+    if !layer.is_null() {
+        let (r, g, b) = COVER_BG;
+        let bg: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithSRGBRed: r, green: g, blue: b, alpha: 1.0f64];
+        let cg: *mut AnyObject = msg_send![bg, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: cg];
+    }
+
+    let cx = bounds.size.width / 2.0;
+    let cy = bounds.size.height / 2.0;
+    // NSView is bottom-left origin: a larger y sits higher on screen, so the
+    // spinner goes above centre and the label below it.
+    let spinner: *mut AnyObject = msg_send![class!(NSProgressIndicator), new];
+    if !spinner.is_null() {
+        let frame = CGRect {
+            origin: CGPoint { x: cx - 16.0, y: cy + 6.0 },
+            size: CGSize { width: 32.0, height: 32.0 },
+        };
+        let _: () = msg_send![spinner, setFrame: frame];
+        // NSProgressIndicatorStyleSpinning
+        let _: () = msg_send![spinner, setStyle: 1usize];
+        let _: () = msg_send![spinner, setIndeterminate: Bool::YES];
+        // Flexible margins on all four sides keeps it centred on resize.
+        let _: () = msg_send![spinner, setAutoresizingMask: 45usize];
+        let _: () = msg_send![cover, addSubview: spinner];
+        let _: () = msg_send![spinner, startAnimation: nil];
+        let _: () = msg_send![spinner, autorelease];
+    }
+
+    // A non-editable, undecorated NSTextField is the label recipe that works on
+    // every supported macOS.
+    let label: *mut AnyObject = msg_send![class!(NSTextField), new];
+    if !label.is_null() {
+        let _: () = msg_send![label, setStringValue: ns_string(msg)];
+        let _: () = msg_send![label, setEditable: Bool::NO];
+        let _: () = msg_send![label, setSelectable: Bool::NO];
+        let _: () = msg_send![label, setBezeled: Bool::NO];
+        let _: () = msg_send![label, setBordered: Bool::NO];
+        let _: () = msg_send![label, setDrawsBackground: Bool::NO];
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+        if !font.is_null() {
+            let _: () = msg_send![label, setFont: font];
+        }
+        let (r, g, b) = COVER_FG;
+        let fg: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithSRGBRed: r, green: g, blue: b, alpha: 1.0f64];
+        let _: () = msg_send![label, setTextColor: fg];
+        let _: () = msg_send![label, setAutoresizingMask: 45usize];
+        let _: () = msg_send![cover, addSubview: label];
+        center_label(label, cy - 30.0);
+        let _: () = msg_send![label, autorelease];
+    }
+    (cover, label)
+}
+
+/// Size the label to its text and centre it horizontally at height `y`.
+/// Cheaper than an alignment enum, whose value differs between Intel and Apple
+/// Silicon macOS.
+#[cfg(target_os = "macos")]
+unsafe fn center_label(label: *mut objc2::runtime::AnyObject, y: f64) {
+    use crate::geom::{CGPoint, CGRect};
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let _: () = msg_send![label, sizeToFit];
+    let sup: *mut AnyObject = msg_send![label, superview];
+    if sup.is_null() {
+        return;
+    }
+    let sb: CGRect = msg_send![sup, bounds];
+    let f: CGRect = msg_send![label, frame];
+    let centred = CGRect {
+        origin: CGPoint { x: ((sb.size.width - f.size.width) / 2.0).max(0.0), y },
+        size: f.size,
+    };
+    let _: () = msg_send![label, setFrame: centred];
+}
+
+#[cfg(target_os = "ios")]
+unsafe fn build_cover(
+    bounds: geom::CGRect,
+    msg: &str,
+) -> (*mut objc2::runtime::AnyObject, *mut objc2::runtime::AnyObject) {
+    use crate::geom::{CGPoint, CGRect, CGSize};
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    let nil: *mut AnyObject = std::ptr::null_mut();
+    let cover: *mut AnyObject = msg_send![class!(UIView), new];
+    if cover.is_null() {
+        return (nil, nil);
+    }
+    let _: () = msg_send![cover, setFrame: bounds];
+    // FlexibleWidth | FlexibleHeight
+    let _: () = msg_send![cover, setAutoresizingMask: 18usize];
+    let (r, g, b) = COVER_BG;
+    let bg: *mut AnyObject =
+        msg_send![class!(UIColor), colorWithRed: r, green: g, blue: b, alpha: 1.0f64];
+    if !bg.is_null() {
+        let _: () = msg_send![cover, setBackgroundColor: bg];
+    }
+
+    let cx = bounds.size.width / 2.0;
+    let cy = bounds.size.height / 2.0;
+    // UIView is top-left origin: the spinner goes above centre by subtracting.
+    let spinner: *mut AnyObject = msg_send![class!(UIActivityIndicatorView), new];
+    if !spinner.is_null() {
+        // UIActivityIndicatorViewStyleLarge
+        let _: () = msg_send![spinner, setActivityIndicatorViewStyle: 101isize];
+        let frame = CGRect {
+            origin: CGPoint { x: cx - 18.0, y: cy - 48.0 },
+            size: CGSize { width: 36.0, height: 36.0 },
+        };
+        let _: () = msg_send![spinner, setFrame: frame];
+        let white: *mut AnyObject = msg_send![class!(UIColor), whiteColor];
+        if !white.is_null() {
+            let _: () = msg_send![spinner, setColor: white];
+        }
+        let _: () = msg_send![spinner, setAutoresizingMask: 45usize];
+        let _: () = msg_send![cover, addSubview: spinner];
+        let _: () = msg_send![spinner, startAnimating];
+        let _: () = msg_send![spinner, autorelease];
+    }
+
+    let label: *mut AnyObject = msg_send![class!(UILabel), new];
+    if !label.is_null() {
+        let frame = CGRect {
+            origin: CGPoint { x: 0.0, y: cy + 4.0 },
+            size: CGSize { width: bounds.size.width, height: 24.0 },
+        };
+        let _: () = msg_send![label, setFrame: frame];
+        let _: () = msg_send![label, setText: ns_string(msg)];
+        let font: *mut AnyObject = msg_send![class!(UIFont), systemFontOfSize: 15.0f64];
+        if !font.is_null() {
+            let _: () = msg_send![label, setFont: font];
+        }
+        let (r, g, b) = COVER_FG;
+        let fg: *mut AnyObject =
+            msg_send![class!(UIColor), colorWithRed: r, green: g, blue: b, alpha: 1.0f64];
+        if !fg.is_null() {
+            let _: () = msg_send![label, setTextColor: fg];
+        }
+        // NSTextAlignmentCenter (UIKit values are unambiguous).
+        let _: () = msg_send![label, setTextAlignment: 1isize];
+        // Full-width label: flexible width + flexible top/bottom margins.
+        let _: () = msg_send![label, setAutoresizingMask: 42usize];
+        let _: () = msg_send![cover, addSubview: label];
+        let _: () = msg_send![label, autorelease];
+    }
+    (cover, label)
+}
+
+/// Replace the cover's status line. Main thread only.
+#[cfg(target_os = "macos")]
+unsafe fn set_cover_text(label: *mut objc2::runtime::AnyObject, msg: &str) {
+    use crate::geom::CGRect;
+    use objc2::msg_send;
+
+    let _: () = msg_send![label, setStringValue: ns_string(msg)];
+    // Keep the line where it is vertically, re-centre it for its new width.
+    let f: CGRect = msg_send![label, frame];
+    center_label(label, f.origin.y);
+}
+
+#[cfg(target_os = "ios")]
+unsafe fn set_cover_text(label: *mut objc2::runtime::AnyObject, msg: &str) {
+    use objc2::msg_send;
+    let _: () = msg_send![label, setText: ns_string(msg)];
+}
+
+/// Lay the cover over the webview (or, if one is already up, just retitle it)
+/// and take a reference on it. Every call must be paired with
+/// `hide_render_cover`.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn show_render_cover(webview: &tauri::WebviewWindow, msg: &str) {
+    use crate::geom::CGRect;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let msg = msg.to_string();
+    let _ = webview.with_webview(move |platform| unsafe {
+        COVER_DEPTH.fetch_add(1, SeqCst);
+        let existing = COVER_LABEL.load(SeqCst);
+        if COVER_VIEW.load(SeqCst) != 0 {
+            if existing != 0 {
+                set_cover_text(existing as *mut AnyObject, &msg);
+            }
+            return;
+        }
+        let wk = platform.inner() as *mut AnyObject;
+        if wk.is_null() {
+            return;
+        }
+        // Cover the webview's container, not the webview: the render shrinks
+        // the webview itself, and the bare container behind it is half of what
+        // looks broken.
+        let sv: *mut AnyObject = msg_send![wk, superview];
+        if sv.is_null() {
+            return;
+        }
+        let b: CGRect = msg_send![sv, bounds];
+        if b.size.width <= 1.0 || b.size.height <= 1.0 {
+            return; // not laid out yet — better no cover than a zero-size one
+        }
+        let (cover, label) = build_cover(b, &msg);
+        if cover.is_null() {
+            return;
+        }
+        // Last subview wins on both AppKit and UIKit, so this sits on top.
+        let _: () = msg_send![sv, addSubview: cover];
+        COVER_VIEW.store(cover as usize, SeqCst);
+        COVER_LABEL.store(label as usize, SeqCst);
+    });
+}
+
+/// Update the cover's status line, if one is up.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn set_render_cover_message(webview: &tauri::WebviewWindow, msg: &str) {
+    use objc2::runtime::AnyObject;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let msg = msg.to_string();
+    let _ = webview.with_webview(move |_platform| unsafe {
+        let label = COVER_LABEL.load(SeqCst);
+        if label != 0 {
+            set_cover_text(label as *mut AnyObject, &msg);
+        }
+    });
+}
+
+/// Drop a reference on the cover; the last one out takes it down.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn hide_render_cover(webview: &tauri::WebviewWindow) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let _ = webview.with_webview(move |_platform| unsafe {
+        let left = COVER_DEPTH.load(SeqCst).saturating_sub(1);
+        COVER_DEPTH.store(left, SeqCst);
+        if left > 0 {
+            return;
+        }
+        COVER_LABEL.store(0, SeqCst);
+        let cover = COVER_VIEW.swap(0, SeqCst);
+        if cover == 0 {
+            return;
+        }
+        let cover = cover as *mut AnyObject;
+        let _: () = msg_send![cover, removeFromSuperview];
+        let _: () = msg_send![cover, autorelease];
+    });
+}
+
+// The cover only exists where the native renderer does.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn show_render_cover(_webview: &tauri::WebviewWindow, _msg: &str) {}
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn set_render_cover_message(_webview: &tauri::WebviewWindow, _msg: &str) {}
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn hide_render_cover(_webview: &tauri::WebviewWindow) {}
+
+/// Wait (bounded) for the in-page pdf.js overlay to actually paint the pages
+/// it was just handed, so the cover comes down on a finished preview instead
+/// of on the overlay's own "building" placeholder. `__pvState` reports
+/// "pending" until the first page is drawn ("drawn"), the render fails
+/// ("error"), or the overlay is gone ("none").
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+async fn await_preview_paint(webview: &tauri::WebviewWindow) {
+    const PROBE: &str =
+        "(window.wwwToPdf&&window.wwwToPdf.__pvState?window.wwwToPdf.__pvState():'none')";
+    for _ in 0..50 {
+        // Anything but "pending" — including an older editor with no
+        // __pvState, or a JS error — means there is nothing left to wait for.
+        match eval_js_string(webview, PROBE).await {
+            Ok(s) if s.trim() == "pending" => {}
+            _ => return,
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+async fn await_preview_paint(_webview: &tauri::WebviewWindow) {}
 
 /// iOS: size the WKWebView to its superview and let UIKit keep it there.
 /// wry attaches the webview with an autoresizing mask (not Auto Layout), so its
@@ -1526,6 +1912,8 @@ async fn render_pdf(
         if meas.h < 1.0 || meas.w < 1.0 {
             return Err("could not measure the page".into());
         }
+
+        set_render_cover_message(webview, "Capturing the page…");
 
         // 4. Grow the frame to the full content height so the whole document
         //    is laid out (usually a no-op after the settle phase), then
