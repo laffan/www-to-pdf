@@ -71,6 +71,11 @@
     // nodes injected later. `userChoice` remembers an explicit toggle so an
     // engine update can't re-enable what the user turned off.
     adblock: { enabled: false, userChoice: null, source: "", selectors: [], cssText: "" },
+    // Set the moment archive.is mode is checked, before the archive.is load
+    // commits. Archive mode is otherwise read off the location (onArchivePage),
+    // but that load can take a while with the old page still on screen, and the
+    // ad blocker has to stand down for it (see adblockUnavailable).
+    archivePending: false,
   };
 
   // ---- small helpers -------------------------------------------------------
@@ -170,6 +175,9 @@
       "input." + NS + "-check:checked::after{content:''!important;display:block!important;position:absolute!important;" +
         "left:5px!important;top:2px!important;width:3px!important;height:7px!important;box-sizing:content-box!important;" +
         "border:solid #fff!important;border-width:0 2px 2px 0!important;transform:rotate(45deg)!important;background:none!important}",
+      // A toggle that can't apply right now (Block ads under archive.is mode):
+      // still drawn, visibly inert. The label around it carries the reason.
+      "input." + NS + "-check:disabled{cursor:not-allowed!important;background:#e4e4e7!important;border-color:#d4d4d8!important}",
       bodyRule,
       washRule,
       hs !== 1 ? headRule : "",
@@ -1028,6 +1036,30 @@
     }
     return rules.join("\n");
   }
+  // Ad blocking and archive.is mode are mutually exclusive. The filter set is
+  // keyed to the live site, but an archive.is snapshot is served whole — the
+  // article and archive.is's own chrome (and its bot check) all from the
+  // archive domain — so those cosmetic rules land on the wrong markup and can
+  // hide the snapshot itself. Rather than run and misfire, the toggle goes
+  // dead and says why.
+  var ADBLOCK_ARCHIVE_WHY =
+    "Unavailable in archive.is mode: ad filters are keyed to the live site, " +
+    "and on an archive.is snapshot they can hide the page itself — its bot " +
+    "check included. Uncheck archive.is mode to block ads again.";
+  function adblockUnavailable() {
+    return state.archivePending || onArchivePage();
+  }
+  // Single rule for whether the blocker actually runs: the user's choice (an
+  // explicit "off" outlives an engine update), a non-empty filter set, and not
+  // in archive.is mode. Applies the result and refreshes the toggle.
+  function syncAdblockEnabled() {
+    state.adblock.enabled =
+      !adblockUnavailable() &&
+      state.adblock.userChoice !== false &&
+      state.adblock.selectors.length > 0;
+    render_style();
+    refreshAdblockUI();
+  }
   function setAdblockSelectors(list, source) {
     var valid = [];
     var seen = {};
@@ -1046,11 +1078,7 @@
     state.adblock.selectors = valid;
     state.adblock.source = source || "engine";
     state.adblock.cssText = buildAdblockCss(valid);
-    if (state.adblock.userChoice !== false) {
-      state.adblock.enabled = valid.length > 0;
-    }
-    render_style();
-    refreshAdblockUI();
+    syncAdblockEnabled();
   }
   function adblockMatchedCount() {
     if (!state.adblock.enabled || typeof Set === "undefined") return 0;
@@ -1076,9 +1104,7 @@
       class: CLS_CHECK,
       onchange: function (e) {
         state.adblock.userChoice = e.target.checked;
-        state.adblock.enabled = e.target.checked && state.adblock.selectors.length > 0;
-        render_style();
-        refreshAdblockUI();
+        syncAdblockEnabled();
       },
     });
     var label = el(
@@ -1091,24 +1117,24 @@
       style: "font-size:11px;color:#71717a",
     });
     var rowKids = [status];
+    var refreshLink = null;
     if (isNative) {
       // Ask Rust to recompute the filter set (late-loading ads add classes/ids
       // the first harvest missed). Same sentinel channel as everything else.
-      rowKids.push(
-        el(
-          "a",
-          {
-            href: "#",
-            title: "Recompute ad filters for this page",
-            style: "font:11px system-ui;color:#2563eb;text-decoration:none;cursor:pointer",
-            onclick: function (e) {
-              e.preventDefault();
-              window.location.href = "https://" + ADBLOCK_HOST + "/?action=refresh";
-            },
+      refreshLink = el(
+        "a",
+        {
+          href: "#",
+          title: "Recompute ad filters for this page",
+          style: "font:11px system-ui;color:#2563eb;text-decoration:none;cursor:pointer",
+          onclick: function (e) {
+            e.preventDefault();
+            window.location.href = "https://" + ADBLOCK_HOST + "/?action=refresh";
           },
-          ["↻ Refresh filters"]
-        )
+        },
+        ["↻ Refresh filters"]
       );
+      rowKids.push(refreshLink);
     }
     var row = el(
       "div",
@@ -1118,9 +1144,22 @@
       },
       rowKids
     );
+    var box = el("div", {}, [label, row]);
     refreshAdblockUI = function () {
+      var off = adblockUnavailable();
+      cb.disabled = off;
       cb.checked = state.adblock.enabled;
-      if (!state.adblock.selectors.length) {
+      // The whole block carries the explanation: a disabled input fires no
+      // hover of its own, so its own title would never show.
+      if (off) box.setAttribute("title", ADBLOCK_ARCHIVE_WHY);
+      else box.removeAttribute("title");
+      label.style.cursor = off ? "not-allowed" : "pointer";
+      label.style.opacity = off ? "0.45" : "1";
+      // Recomputing filters is meaningless while they can't be applied.
+      if (refreshLink) refreshLink.style.display = off ? "none" : "";
+      if (off) {
+        status.textContent = "off · archive.is mode";
+      } else if (!state.adblock.selectors.length) {
         status.textContent = "No ad filters loaded yet";
       } else {
         var src =
@@ -1133,7 +1172,7 @@
       }
     };
     refreshAdblockUI();
-    return el("div", {}, [label, row]);
+    return box;
   }
 
   // ---- archive.is mode (native) ---------------------------------------------
@@ -1280,6 +1319,11 @@
       onchange: function (e) {
         if (e.target.checked) {
           if (onArchivePage()) return; // already on archive.is
+          // Ad blocking stands down for archive mode. Do it now rather than on
+          // arrival: fetching a snapshot can take a while, and this page stays
+          // on screen (with this toolbar) the whole time.
+          state.archivePending = true;
+          syncAdblockEnabled();
           toast("Opening archive.is…");
           // Go to the archive.is home page and carry this article's URL in the
           // fragment; the editor there fills the submit form and clicks save
@@ -1293,6 +1337,11 @@
           // sentinel (which defeats iOS Universal-Link hijacking).
           var orig = originalFromArchive();
           if (orig) loadInWebview(orig);
+        } else {
+          // Changed their mind before archive.is loaded: this page is staying,
+          // so give the ad blocker back.
+          state.archivePending = false;
+          syncAdblockEnabled();
         }
       },
     });
@@ -1313,7 +1362,9 @@
     );
     refreshArchiveUI = function () {
       var on = onArchivePage();
-      cb.checked = on;
+      // Checked from the moment the snapshot is requested; the rest of the
+      // section only makes sense once one is actually loaded.
+      cb.checked = on || state.archivePending;
       extractBtn.style.display = on ? "block" : "none";
       hint.style.display = on ? "none" : "block";
     };

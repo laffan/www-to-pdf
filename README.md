@@ -17,7 +17,8 @@ lets you jump straight back to any of them:
    snapshot's `#CONTENT` out and drops archive.is's own chrome so it edits like
    any other page. A built-in **ad blocker** (Bushido-style — EasyList cosmetic
    filters via Brave's adblock engine) hides known ad containers automatically;
-   toggle it in the pane. Removal sets save as **presets**, re-applied on later
+   toggle it in the pane (archive.is mode disables it — hover the greyed-out
+   toggle for why). Removal sets save as **presets**, re-applied on later
    visits or on other sites with the same layout (e.g. any Substack).
 3. **Format** — "Next" flips the toolbar to formatting: body size, line height,
    heading scale, per-side margins (US Letter), a sans-serif metadata header
@@ -240,6 +241,17 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   link (the `wwwtopdf.adblock` sentinel) for ad units that load late. The web
   build — and a native first run while offline — falls back to a small
   built-in list of unambiguous ad selectors.
+- **Ad blocking and archive.is mode are exclusive.** A snapshot serves the
+  article *and* archive.is's own chrome — bot check included — from the archive
+  domain, so filters keyed to the live site land on the wrong markup and can
+  hide the snapshot itself. So in archive.is mode the "Block ads" toggle is
+  disabled and greyed out, reads *off · archive.is mode*, and explains itself on
+  hover; the "↻ Refresh filters" link goes with it. It stands down the moment
+  the box is ticked, not when the snapshot lands — fetching one takes a while
+  and the old page (and its toolbar) stays on screen throughout. Un-ticking
+  before the snapshot arrives gives it straight back. One rule decides it
+  (`syncAdblockEnabled`), so an engine push mid-snapshot can't switch it back
+  on, and an explicit "off" still outlives a filter update.
 - **Session persistence (stay logged in):** the webview runs with a
   **non-persistent (incognito) data store** — on purpose: a persistent store
   makes WKWebView write a "WebCrypto Master Key" to the login keychain, which
