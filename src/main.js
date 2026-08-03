@@ -43,6 +43,63 @@ $("url-form").addEventListener("submit", (e) => {
   load(url);
 });
 
+// ---- paste from clipboard ---------------------------------------------------
+// Fills the field; loading stays a deliberate second click, so a stale
+// clipboard can't navigate the app somewhere on one tap.
+//
+// Two routes, because the two builds have different clipboards to ask. The web
+// build is served over HTTPS — a secure context — so it uses the async
+// Clipboard API. The app serves its own page from a custom scheme, which is not
+// a secure context, so `navigator.clipboard` can't be counted on there; it asks
+// Rust over the same sentinel channel everything else uses, and Rust evals the
+// text back through `__wwwpdfPasted`. Either way the OS may show its own paste
+// confirmation; that's expected — the user just asked to paste.
+let pasteTimer = null;
+$("paste-btn").addEventListener("click", async () => {
+  $("entry-error").hidden = true;
+  // Either route can simply go quiet: a permission or OS paste prompt the user
+  // never answers (readText() then stays pending forever — no rejection), or a
+  // sentinel that doesn't land. So every attempt is on a clock, and a late
+  // arrival still fills the field and clears the notice.
+  clearTimeout(pasteTimer);
+  pasteTimer = setTimeout(clipboardUnavailable, 4000);
+  if (isTauri) {
+    window.location.href = "https://wwwtopdf.paste/";
+    return;
+  }
+  try {
+    fillFromClipboard(await navigator.clipboard.readText());
+  } catch {
+    clipboardUnavailable();
+  }
+});
+
+function clipboardUnavailable() {
+  clearTimeout(pasteTimer);
+  showEntryError("Couldn't read the clipboard — paste into the field instead.");
+}
+
+function fillFromClipboard(text) {
+  clearTimeout(pasteTimer);
+  const input = $("url-input");
+  const raw = (text || "").trim();
+  if (!raw) return showEntryError("Nothing on the clipboard to paste.");
+  // A URL never contains whitespace, and normalizeUrl is too forgiving to be
+  // the judge on its own ("not a url" becomes https://not%20a%20url/). Prose
+  // goes in raw so it can be edited, and says so.
+  const url = /\s/.test(raw) ? null : normalizeUrl(raw);
+  // Otherwise show what would actually load: normalizeUrl is what Load applies
+  // anyway, and an un-normalized "example.com" fails the type=url field's own
+  // validation before the submit handler ever runs.
+  input.value = url || raw;
+  input.focus();
+  input.select();
+  if (url) $("entry-error").hidden = true;
+  else showEntryError("That doesn't look like a URL.");
+}
+// Called from Rust (app) with the clipboard's text — "" if there was none.
+window.__wwwpdfPasted = fillFromClipboard;
+
 // ---- history (stage 1) ------------------------------------------------------
 // Entries are { u: url, t: title }. The title arrives later than the URL (once
 // the page has loaded and reported document.title), so it's filled in by

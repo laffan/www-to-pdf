@@ -67,6 +67,23 @@ body {
   border-radius: 11px;
   cursor: pointer;
 }
+/* Paste: a quiet icon next to the primary action, sized by the row (the flex
+   row stretches it to the input's height, so the two always line up). */
+.url-form .icon-btn {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 13px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.url-form .icon-btn:hover { background: var(--card); color: var(--ink); }
+.url-form .icon-btn:focus-visible { outline: 2px solid var(--ink); outline-offset: 1px; }
+.url-form .icon-btn svg { display: block; }
 .entry-note { color: #dc2626; font-size: 13px; margin: 0; }
 .entry-status {
   color: var(--muted);

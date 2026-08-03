@@ -44,6 +44,7 @@ const HOME_HOST: &str = "wwwtopdf.home"; // back to URL entry
 const PRESET_HOST: &str = "wwwtopdf.preset"; // ?action=save|update|delete…
 const LOAD_HOST: &str = "wwwtopdf.load"; // ?url=… -> native WKWebView load
 const ADBLOCK_HOST: &str = "wwwtopdf.adblock"; // ?action=refresh -> recompute ad filters
+const PASTE_HOST: &str = "wwwtopdf.paste"; // -> read the system clipboard back into the page
 
 // A real Safari user-agent for the webview. WKWebView's default UA omits the
 // "Version/x Safari/x" tokens, so it reads as a bare embedded WebKit client —
@@ -316,6 +317,82 @@ fn go_home(app: &tauri::AppHandle) {
     }
 }
 
+/// Read the system clipboard and hand the text to the URL-entry page.
+///
+/// The page could ask for it itself with `navigator.clipboard.readText()`, but
+/// that API is gated on a secure context, which the app's custom scheme is not
+/// — so it takes the same route as everything else here: a sentinel in, an eval
+/// out. The reply is always sent, empty text included, so the page never waits
+/// on a message that isn't coming. Reading the pasteboard may raise the system's
+/// own paste confirmation (iOS 16+); that's expected, the user just asked to
+/// paste.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn push_clipboard_text(app: &tauri::AppHandle) {
+    let Some(webview) = app.get_webview_window("main") else {
+        return;
+    };
+    // Pasteboard reads are main-thread work (and cheap).
+    let _ = app.run_on_main_thread(move || {
+        let text = unsafe { read_pasteboard_string() }.unwrap_or_default();
+        let js = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into());
+        let _ = webview.eval(&format!(
+            "window.__wwwpdfPasted&&window.__wwwpdfPasted({js})"
+        ));
+    });
+}
+
+/// Plain text off the general pasteboard, or None if there is none.
+#[cfg(target_os = "macos")]
+unsafe fn read_pasteboard_string() -> Option<String> {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pb.is_null() {
+        return None;
+    }
+    // NSPasteboardTypeString
+    let ty = ns_string("public.utf8-plain-text");
+    let s: *mut AnyObject = msg_send![pb, stringForType: ty];
+    ns_to_string(s)
+}
+
+#[cfg(target_os = "ios")]
+unsafe fn read_pasteboard_string() -> Option<String> {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    let pb: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
+    if pb.is_null() {
+        return None;
+    }
+    let s: *mut AnyObject = msg_send![pb, string];
+    ns_to_string(s)
+}
+
+/// Copy an NSString out to a Rust String (None for nil / no UTF-8).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe fn ns_to_string(s: *mut objc2::runtime::AnyObject) -> Option<String> {
+    use objc2::msg_send;
+
+    if s.is_null() {
+        return None;
+    }
+    let utf8: *const std::os::raw::c_char = msg_send![s, UTF8String];
+    if utf8.is_null() {
+        return None;
+    }
+    Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
+}
+
+// No pasteboard binding off Apple; reply anyway so the page stops waiting.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn push_clipboard_text(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.eval("window.__wwwpdfPasted&&window.__wwwpdfPasted(\"\")");
+    }
+}
+
 /// on_navigation hook: intercept sentinel navigations. Returns true if this was
 /// a sentinel (so the navigation should be cancelled), false to allow it.
 fn handle_sentinel(app: &tauri::AppHandle, nav_url: &Url) -> bool {
@@ -342,6 +419,11 @@ fn handle_sentinel(app: &tauri::AppHandle, nav_url: &Url) -> bool {
             // harvest missed).
             let app = app.clone();
             tauri::async_runtime::spawn(async move { push_adblock_selectors(&app).await });
+            true
+        }
+        Some(PASTE_HOST) => {
+            // "Paste from clipboard" on the URL-entry page.
+            push_clipboard_text(app);
             true
         }
         Some(LOAD_HOST) => {

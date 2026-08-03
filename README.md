@@ -7,9 +7,10 @@ multiple windows) with an in-page toolbar that progresses through panes. A
 **Link · Edit · Format** breadcrumb in the toolbar header tracks the stage and
 lets you jump straight back to any of them:
 
-1. **Link** — type a URL or pick from your recent links (each shows the page's
-   title once loaded). The one webview then navigates to the site in place.
-   Clicking **Link** in the breadcrumb returns here.
+1. **Link** — type a URL, paste one with the clipboard button beside **Load**,
+   or pick from your recent links (each shows the page's title once loaded).
+   The one webview then navigates to the site in place. Clicking **Link** in
+   the breadcrumb returns here.
 2. **Edit** — log in if needed, then click elements to remove clutter (nav
    bars, cookie banners, ads…). An **archive.is mode** checkbox (above the ad
    blocker) reroutes the current article through archive.is for a paywall-free
@@ -88,6 +89,21 @@ Output is **US Letter (8.5 × 11 in)** with adjustable per-side margins.
   (back to URL entry), `wwwtopdf.preset?action=…` (persist). Fonts/metadata are
   applied directly to the page DOM (so `createPDF` captures them); only margins,
   header/footer, page-numbers and the filename ride the export sentinel.
+- **Paste from the clipboard.** The clipboard button beside **Load** fills the
+  URL field; loading stays a separate click, so a stale clipboard can't send the
+  app somewhere on one tap. The web build asks `navigator.clipboard.readText()`.
+  The app can't count on it — that API is gated on a secure context, which the
+  app's own custom scheme isn't — so it takes the same route as everything else
+  here: a `wwwtopdf.paste`
+  sentinel in, and Rust reads `NSPasteboard`/`UIPasteboard` and evals the text
+  back through `__wwwpdfPasted`. Both routes run on a clock, because the
+  interesting failure is silence: an OS paste prompt the user never answers
+  leaves `readText()` pending forever rather than rejecting. Pasted text is
+  normalised the way **Load** would (`example.com/x` → `https://example.com/x`,
+  which the `type=url` field would otherwise reject), except when it contains
+  whitespace — no URL does, and `new URL()` is forgiving enough to turn a
+  sentence into `https://not%20a%20url/` — so prose lands in the field
+  unchanged, and says so.
 - **Inline preview with pdf.js.** Entering Format renders the real PDF and
   shows it *inside the page*: Rust injects a vendored pdf.js (UMD build +
   worker) into the target webview and streams the rendered PDF bytes over as
