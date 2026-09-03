@@ -1,0 +1,62 @@
+name: Release macOS DMG
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# tauri-action needs write access to create the release and upload the DMGs.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            label: Apple Silicon
+          - target: x86_64-apple-darwin
+            label: Intel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.target }}
+
+      - run: npm ci
+
+      # tauri.conf.json runs `npm run build` itself via beforeBuildCommand.
+      # `--bundles dmg` overrides the config's "targets": "all".
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # __VERSION__ is substituted with the version in tauri.conf.json, so
+          # this works for both tag pushes and manual runs.
+          tagName: v__VERSION__
+          releaseName: www-to-pdf v__VERSION__
+          releaseBody: |
+            macOS build of www-to-pdf.
+
+            Download the DMG for your Mac (`aarch64` for Apple Silicon, `x64`
+            for Intel). The app is unsigned, so on first launch macOS will
+            block it — right-click the app and choose Open, or run
+            `xattr -dr com.apple.quarantine /Applications/www-to-pdf.app`.
+          releaseDraft: false
+          prerelease: false
+          args: --target ${{ matrix.target }} --bundles dmg
